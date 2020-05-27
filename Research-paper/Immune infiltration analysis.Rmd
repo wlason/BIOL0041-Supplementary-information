@@ -1,0 +1,460 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(biomaRt)
+library(plyr)
+library(stringr)
+library(RColorBrewer)
+library(sva)
+
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+
+solid_tumours <- c("BLCA", "BRCA", "CESC", "CHOL", "COAD", "ESCA",  "HNSC", "KICH", "KIRC", "KIRP", "LIHC", "LUAD", "LUSC", "PRAD", "STAD", "THCA", "UCEC")
+```
+
+```{r Programme definitions}
+#APOBEC, dormancy, exhaustion
+dormancy_list <- c("CD80", "CD274", "CXCL9", "CXCL10", "IRF7", "IFNAR1", "IFNAR2", "IFNG", "TNF", "STAT1", "TNFRSF1A", "PLAUR", "PTK2", "ITGA5", "ITGB1", "KDR", "VEGFA", "MMP9", "ZEB1")
+
+exhaustion_list <- c("CD244", "BATF", "PRDM1", "CD160", "ENTPD1", "ITGAE", "EOMES", "TBX21", "IFNG", "IL10", "IL12A", "EBI3", "STAT1", "STAT3", "STAT4", "IRF4", "LAG3", "NFATC1", "NFATC2", "NFATC4", "PDCD1", "CTLA4", "PROCR", "PDPN", "MAF", "PTPN11", "SPRY1", "SPRY2", "TIGIT", "CD226", "HAVCR2", "TRAF1")
+
+apobec_list <- c("AICDA", "APOBEC1", "APOBEC2", "APOBEC3A", "APOBEC3B", "APOBEC3C", "APOBEC3D", "APOBEC3F", "APOBEC3G", "APOBEC3H", "APOBEC4")
+
+#Vector of all the studied programmes (for convenience)
+all_genes_list <- unique(c(dormancy_list, exhaustion_list, apobec_list))
+
+#Hypoxia
+load("hypoxia.RData")
+hypoxia <- list("Buffa" = hypoxia_buffa, "Winter" = hypoxia_winter, "West" = hypoxia_west)
+```
+
+
+```{r}
+ensembl <- useMart("ensembl",dataset="hsapiens_gene_ensembl")
+
+for(cancer in solid_tumours){
+  
+  query <- GDCquery(project = paste0("TCGA-", cancer),
+                    data.category = "Transcriptome Profiling",
+                    data.type = "Gene Expression Quantification", 
+                    workflow.type = "HTSeq - FPKM",
+                    sample.type = "Primary Tumor")
+  GDCdownload(query)
+  data <- GDCprepare(query,
+                     summarizedExperiment = T, 
+                     save = TRUE, 
+                     save.filename = paste0(cancer, "-FPKM-01A.rda"))
+  data_matrix <- as.data.frame(assay(data))
+  
+  hugo <- getBM(attributes=c('ensembl_gene_id', 'hgnc_symbol'), 
+      filters = 'ensembl_gene_id', 
+      values = rownames(data_matrix), 
+      mart = ensembl)
+  
+  hugo <- hugo[!duplicated(hugo$hgnc_symbol), ]
+  data_matrix <- data_matrix[hugo$ensembl_gene_id, ]
+  
+  rownames(data_matrix) <- mapvalues(rownames(data_matrix), from = hugo$ensembl_gene_id, to = hugo$hgnc_symbol)
+  
+  immune_estimates <- consensusTMEAnalysis(as.matrix(data_matrix), cancer = cancer, statMethod = "ssgsea")
+  
+  print(paste0("Done ", cancer))
+
+}
+
+immune_estimates_gg <- melt(immune_estimates)
+ggboxplot(immune_estimates_gg, x = "Var1", y = "value")
+
+cor_matrix <- cor(t(immune_estimates))
+
+corrplot::corrplot(cor_matrix)
+
+
+cancer <- read.delim(paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", cancer, "-rsem-fpkm-tcga-t.txt.gz"))
+
+rownames(cancer) <- cancer$Hugo_Symbol
+cancer$Hugo_Symbol <- NULL
+cancer$Entrez_Gene_Id <- NULL
+immune_estimates_2 <- consensusTMEAnalysis(as.matrix(cancer), cancer = "COAD", statMethod = "ssgsea")
+immune_estimates_2_gg <- melt(immune_estimates_2)
+ggboxplot(immune_estimates_gg, x = "Var1", y = "value")
+
+cor_matrix_2 <- cor(t(immune_estimates_2))
+immune_estimates <- consensusTMEAnalysis(as.matrix(data_matrix), cancerType = "COAD", statMethod = "gsva")
+
+
+pdf("TCGA_ConsensusTME_corr.pdf", width = 6, height = 6)
+corrplot::corrplot(cor_matrix, tl.col = "black", title = "COAD from GDC server")
+dev.off()
+
+pdf("Wang_ConsensusTME_corr.pdf", width = 6, height = 6)
+corrplot::corrplot(cor_matrix_2, tl.col = "black", title = "COAD from Wang et al.")
+dev.off
+```
+
+
+```{r}
+bindea <- ConsensusTME::methodSignatures$Bindea
+immune_estimates_bindea <- ConsensusTME::geneSetEnrichment(as.matrix(cancer), bindea)
+cor_matrix_bindea <- cor(t(immune_estimates_bindea))
+p_matrix_bindea <- cor.mtest(t(immune_estimates_bindea))$p
+
+davoli <- ConsensusTME::methodSignatures$Davoli
+immune_estimates_davoli <- ConsensusTME::geneSetEnrichment(as.matrix(cancer), davoli)
+cor_matrix_davoli <- cor(t(immune_estimates_davoli))
+p_matrix_davoli <- cor.mtest(t(immune_estimates_davoli))$p
+
+
+pdf("Wang_bindea_corr.pdf", width = 6, height = 6)
+corrplot(cor_matrix_bindea, p.mat = p_matrix_bindea, insig = "pch", tl.col = "black", title = "COAD - Bindea")
+dev.off()
+
+pdf("Wang_davoli_corr.pdf", width = 6, height = 6)
+corrplot(cor_matrix_davoli, p.mat = p_matrix_davoli, insig = "pch", tl.col = "black", title = "COAD - Davoli")
+dev.off()
+```
+
+```{r Download FPKM data}
+for (tumour in solid_tumours){
+  #Indicate progress
+  print(paste0(tumour, ": This is ", match(tumour, solid_tumours), " out of ", length(solid_tumours)))
+  tumour <- str_to_lower(tumour)
+
+  file_cancer <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga-t.txt.gz")
+  cancer <- read.delim(file_cancer)
+  
+  rownames(cancer) <- cancer$Hugo_Symbol
+  cancer <- cancer[, c(-1, -2)]
+  
+  tumour <- str_to_upper(tumour)
+  
+  if (tumour == solid_tumours[1]){
+    TME_cancer <- list()
+  }
+    
+  TME_cancer[[tumour]] <- as.matrix(cancer)
+}
+rm(tumour, file_cancer, cancer)
+
+#Remove outlier:
+TME_cancer <- lapply(TME_cancer, function(x) x[, !(colnames(x) %in% grep(pattern = "TCGA.38.4625.", colnames(x), value = T))])
+```
+
+```{r Generate immune estimates}
+davoli <- ConsensusTME::methodSignatures$Davoli
+immune_estimates_davoli <- lapply(TME_cancer, function(x) ConsensusTME::geneSetEnrichment(as.matrix(x), davoli) )
+
+bindea <- ConsensusTME::methodSignatures$Bindea
+immune_estimates_bindea <- lapply(TME_cancer, function(x) ConsensusTME::geneSetEnrichment(as.matrix(x), bindea) )
+
+rm(iSample, nSamples, progressBar)
+#saveRDS(immune_estimates_davoli, file = "immune_estimates_davoli.rds")
+#saveRDS(immune_estimates_bindea, file = "immune_estimates_bindea.rds")
+```
+
+
+```{r}
+immune_cells <- rownames(immune_estimates_bindea[[1]])
+immune_cells_short <- c("B_cells", "T_gamma_delta_cells", "Th1_cells", "Th2_cells", "Th17_cells", "Treg_cells", "T_effector_memory_cells", "CD8_T_cells", "NK_cells", "plasmacytoid_Dendritic_cells", "activated_Dendritic_cells", "Macrophages","Neutrophils", "Eosinophils", "Mast_cells", "Citotoxic_cells", "T_helper_cells", "Dendritic_cells", "Angiogenesis")
+
+
+cols <- colorRampPalette(rev(brewer.pal(n =11, name = "PRGn")))
+
+immune_estimates_all <- do.call(cbind, immune_estimates_bindea)
+
+corr_all <- cor(t(immune_estimates_all))
+pval_all <- cor.mtest(t(immune_estimates_all))$p
+
+
+pdf(file = paste(Sys.Date(), "bindea_pancancer_immune_correlation.pdf", sep = "_"), height = 8, width = 8)
+corrplot(corr_all, 
+         p.mat = pval_all, 
+         insig = "pch", 
+         tl.col = "black", 
+         col = cols(100),
+         pch.cex = 0.8,
+         pch.col = "firebrick",
+         title = "Pancancer - Bindea")
+dev.off()
+```
+
+##Perform correlation analysis
+###RNAseq data
+```{r Download RNAseq data for programmes}
+solid_tumours <- str_to_lower(solid_tumours)
+
+for (tumour in solid_tumours){
+  #Indicate progress
+  print(paste0(tumour, ": This is ", match(tumour, solid_tumours), " out of ", length(solid_tumours)))
+  
+  file_cancer <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga-t.txt.gz")
+  cancer <- read.delim(file_cancer)
+  
+  rownames(cancer) <- cancer$Hugo_Symbol
+  cancer <- cancer[c(all_genes_list, unlist(hypoxia)), c(-1, -2)]
+  
+  cancer_type <- data.frame("Patient_long" = colnames(cancer))
+  cancer_type$Cancer <- as.character(tumour)
+  
+  if (tumour == solid_tumours[1]){
+    rnaseq_prog_hypo <- cancer
+    cancer_types <- cancer_type
+  } else {
+    rnaseq_prog_hypo <- cbind(rnaseq_prog_hypo, cancer)
+    cancer_types <- rbind(cancer_types, cancer_type)
+  }
+}
+rm(tumour, file_cancer, cancer, cancer_type)
+
+#Remove outlier:
+rnaseq_prog_hypo <- rnaseq_prog_hypo[, -c(grep("TCGA.38.4625.", x = colnames(rnaseq_prog_hypo)))]
+
+#Normalise
+rnaseq_prog_hypo <- log2(rnaseq_prog_hypo+1)
+```
+
+
+###COMBAT correction
+```{r Correcting for tissue effects using combat}
+#Create adjustment matrix
+combat_df <- rnaseq_prog_hypo[, colSums(is.na(rnaseq_prog_hypo)) == 0]
+
+rownames(cancer_types) <- cancer_types$Patient_long
+batches <-  cancer_types[colnames(combat_df), ] #Batch information (which cancer the sample is from)
+
+combat_prog_hypo <- ComBat(dat = as.matrix(combat_df),
+                      batch = batches$Cancer,
+                      mod = NULL,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+```
+
+###Calculate programme expression
+```{r}
+expr_prog <- data.frame(row.names = colnames(combat_prog_hypo))
+expr_prog$mean_APOBEC <- apply(combat_prog_hypo[apobec_list, ], function (x) mean(x), MARGIN = 2)
+expr_prog$Dormancy <- apply(combat_prog_hypo[dormancy_list, ], function (x) mean(x), MARGIN = 2)
+expr_prog$Exhaustion <- apply(combat_prog_hypo[exhaustion_list, ], function (x) mean(x), MARGIN = 2)
+expr_prog$All <- apply(expr_prog[, c("mean_APOBEC", "Dormancy", "Exhaustion")], function (x) mean(x), MARGIN = 1)
+
+expr_hypoxia <- data.frame(row.names = colnames(combat_prog_hypo))
+expr_hypoxia$Buffa <- apply(combat_prog_hypo[hypoxia_buffa, ], function (x) mean(x), MARGIN = 2)
+expr_hypoxia$West <- apply(combat_prog_hypo[hypoxia_west, ], function (x) mean(x), MARGIN = 2)
+expr_hypoxia$Winter <- apply(combat_prog_hypo[hypoxia_winter, ], function (x) mean(x), MARGIN = 2)
+expr_hypoxia$Consensus <- apply(expr_hypoxia[, c("Buffa", "West", "Winter")], function (x) mean(x), MARGIN = 1)
+```
+
+```{r}
+corr_immune_prog <-  merge(expr_prog, t(immune_estimates_all), by = "row.names")
+corr_immune_prog$Row.names <- NULL
+
+corr_matrix_1 <- cor(corr_immune_prog)
+p_matrix_1 <- cor.mtest(corr_immune_prog)$p
+dimnames(p_matrix_1) <- dimnames(corr_matrix_1)
+
+
+corr_immune_hypo <-  merge(expr_hypoxia, t(immune_estimates_all), by = "row.names")
+corr_immune_hypo$Row.names <- NULL
+
+corr_matrix_2 <- cor(corr_immune_hypo)
+p_matrix_2 <- cor.mtest(corr_immune_hypo)$p
+dimnames(p_matrix_2) <- dimnames(corr_matrix_2)
+
+
+corr_immune_all <- merge(expr_hypoxia, expr_prog, by = "row.names")
+rownames(corr_immune_all) <- corr_immune_all$Row.names
+corr_immune_all$Row.names <- NULL
+corr_immune_all <- merge(corr_immune_all, t(immune_estimates_all), by = "row.names")
+corr_immune_all$Row.names <- NULL
+
+corr_matrix_3 <- cor(corr_immune_all)
+p_matrix_3 <- cor.mtest(corr_immune_all)$p
+dimnames(p_matrix_3) <- dimnames(corr_matrix_3)
+```
+
+
+```{r}
+i <- 0
+for (cells in list(immune_cells, immune_cells_short)){
+i <- i+1
+pdf(file = paste0(Sys.Date(), "_bindea_pancancer_immune_correlation_", i, ".pdf"), height = 5, width = 8)
+corrplot(corr_matrix_1[c("mean_APOBEC", "Dormancy", "Exhaustion", "All"), cells], 
+         p.mat = p_matrix_1[c("mean_APOBEC", "Dormancy", "Exhaustion", "All"), cells], 
+         insig = "pch", 
+         tl.col = "black", 
+         col = cols(100),
+         pch.cex = 0.8,
+         pch.col = "firebrick",
+         cl.ratio = 0.1,
+         cl.length = 5,
+         is.corr = T)
+dev.off()
+}
+
+i <- 0
+for (cells in list(immune_cells, immune_cells_short)){
+i <- i+1
+pdf(file = paste0(Sys.Date(), "_bindea_pancancer_hypoxia_correlation_", i, ".pdf"), height = 5, width = 8)
+corrplot(corr_matrix_2[c("Buffa", "West", "Winter", "Consensus"), cells], 
+         p.mat = p_matrix_2[c("Buffa", "West", "Winter", "Consensus"), cells], 
+         insig = "pch", 
+         tl.col = "black", 
+         col = cols(100),
+         pch.cex = 0.8,
+         pch.col = "firebrick",
+         cl.ratio = 0.1,
+         cl.length = 5,
+         is.corr = T)
+dev.off()
+}
+
+i <- 0
+for (cells in list(immune_cells, immune_cells_short)){
+i <- i+1
+pdf(file = paste0(Sys.Date(), "_bindea_pancancer_hypoxia_immune_correlation_", i, ".pdf"), height = 6, width = 8)
+corrplot(corr_matrix_3[c("mean_APOBEC", "Dormancy", "Exhaustion", "All", "Buffa", "West", "Winter", "Consensus"), cells], 
+         p.mat = p_matrix_3[c("mean_APOBEC", "Dormancy", "Exhaustion", "All", "Buffa", "West", "Winter", "Consensus"), cells], 
+         insig = "pch", 
+         tl.col = "black", 
+         col = cols(100),
+         pch.cex = 0.8,
+         pch.col = "firebrick",
+         cl.ratio = 0.1,
+         cl.length = 5,
+         is.corr = T)
+dev.off()
+}
+```
+
+```{r Make and visualise clusters}
+ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, color = as.factor(clusters))) +
+  geom_point() +
+  ggtitle("Clustering on all programmes, k=3")
+
+clusters <- readRDS("k_3_clusters.rds")
+clusters <- clusters$Cluster
+clusters <- factor(recode(clusters, "0" = "2", "1" = "1", "2" = "3"), levels = c("1", "2", "3"))
+
+p <- ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, color = clusters)) +
+  geom_point() +
+  scale_colour_manual(values = c("1" = "#00AFBB", "2" = "#E7B800", "3" = "#FC4E07")) +
+  theme_pubr() +
+  theme(legend.position = "none")
+save_plot(p, filename = paste0(Sys.Date(), "_phate_k-means.pdf"), base_height = 4.5, base_width = 6)
+```
+
+
+```{r Produce PHATE maps}
+immune_annot <- as.data.frame(t(immune_estimates_all[, colnames(combat_df)]))
+
+for (cell in immune_cells){
+  if (cell %in% c("Antigen_presentation_machinery", "Angiogenesis")) {
+    legend <- "Patient \n score"
+  } else {
+    legend <- "Infiltration \n score"
+  }
+  p <- ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, colour = immune_annot[, cell])) +
+        geom_point() +
+        theme(legend.key.width = unit(1, "cm")) +
+        scale_color_gradient2(low = "#59ac53", mid = "grey95", high = "#8b5aa8") +
+        labs(color = legend) +
+        theme_pubr() +
+        theme(legend.position = "right")
+  save_plot(p, filename = paste(Sys.Date(), cell, "bindea_phate.pdf", sep="_"), base_height = 4.5, base_width = 6)
+}
+```
+
+```{r Produce PHATE maps in svg}
+immune_annot <- as.data.frame(t(immune_estimates_all[, colnames(combat_df)]))
+
+for (cell in immune_cells){
+  if (cell %in% c("Antigen_presentation_machinery", "Angiogenesis")) {
+    legend <- "Patient \n score"
+  } else {
+    legend <- "Infiltration \n score"
+  }
+  p <- ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, colour = immune_annot[, cell])) +
+        geom_point() +
+        theme(legend.key.width = unit(1, "cm")) +
+        scale_color_gradient2(low = "#59ac53", mid = "grey95", high = "#8b5aa8") +
+        labs(color = legend) +
+        theme_pubr(legend = "none") +
+        ggtitle(cell) +
+        theme(legend.position = "right", legend.title = element_text(face = "bold", angle = 90)) +
+        guides(colour = guide_colorbar(title.position = "left")) +
+        theme(text = element_text(family = "Helvetica", size = 10))
+  
+  save_plot(p, filename = paste(Sys.Date(), cell, "bindea_phate.svg", sep="_"), base_height = 3, base_width = 4)
+}
+```
+
+
+```{r Produce plots}
+my_comparisons <- combn(c("1", "2", "3"), m = 2, simplify = F)
+
+clusters_annot <- data.frame("Cluster" = clusters, "Patient_long" = rownames(cancer_phate$embedding))
+clusters_annot$Patient_short <- sapply(clusters_annot$Patient_long,
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+
+immune_annot$Patient_long <- rownames(immune_annot)
+
+clusters_annot_immune <- merge(x = immune_annot, y = clusters_annot, by = "Patient_long", all.y = T)
+
+
+for (cell in c("Citotoxic_cells", "CD8_T_cells", "Th17_cells", "T_cells", "Treg_cells", "NK_cells", "Macrophages", "Dendritic_cells", "Antigen_presentation_machinery", "Angiogenesis")){
+  
+  y <- round(max(clusters_annot_immune[, cell]) + 0.2, digits = 1)    #Calculate the position of y label (for K-W test)
+  
+  p <- ggboxplot(clusters_annot_immune, x = "Cluster", y = cell,
+                color = "Cluster", palette =c("#00AFBB", "#E7B800", "#FC4E07")) + 
+                stat_compare_means(comparisons = my_comparisons, label = "p.signif") + # Add pairwise comparisons p-value
+                stat_compare_means(label.y = y) +
+                theme(legend.position = "none")
+
+  save_plot(p, filename = paste(Sys.Date(), cell, "bindea_boxplot.pdf", sep="_"), base_height = 4.5, base_width = 6)
+
+}
+```
+
+```{r Produce plots in svg}
+my_comparisons <- combn(c("1", "2", "3"), m = 2, simplify = F)
+
+clusters_annot <- data.frame("Cluster" = clusters, "Patient_long" = rownames(cancer_phate$embedding))
+clusters_annot$Patient_short <- sapply(clusters_annot$Patient_long,
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+
+immune_annot$Patient_long <- rownames(immune_annot)
+
+clusters_annot_immune <- merge(x = immune_annot, y = clusters_annot, by = "Patient_long", all.y = T)
+
+
+for (cell in immune_cells){
+  
+  y <- round(max(clusters_annot_immune[, cell]) + 0.2, digits = 1)    #Calculate the position of y label (for K-W test)
+  
+  p <- ggboxplot(clusters_annot_immune, x = "Cluster", y = cell,
+                color = "Cluster", palette =c("#00AFBB", "#E7B800", "#FC4E07")) + 
+                stat_compare_means(comparisons = my_comparisons, label = "p.signif") + # Add pairwise comparisons p-value
+                stat_compare_means(label.y.npc = "top") +
+                theme(legend.position = "none")
+
+  save_plot(p, filename = paste(Sys.Date(), cell, "bindea_boxplot.svg", sep="_"), base_height = 4, base_width = 3)
+
+}
+
+
+melt_annot <- melt(clusters_annot_immune[, c("Cluster", "T_helper_cells", "Citotoxic_cells", "Dendritic_cells", "Angiogenesis")])
+p <- ggboxplot(melt_annot, x = "Cluster", y = "value",
+              color = "Cluster", palette =c("#00AFBB", "#E7B800", "#FC4E07")) + 
+              stat_compare_means(comparisons = my_comparisons, label = "p.signif") + # Add pairwise comparisons p-value
+              stat_compare_means(label.y.npc = "top") +
+              theme(legend.position = "none")
+p <- facet(p, facet.by = "variable", nrow = 1, scales = "fixed")
+save_plot(p, filename = "combined_boxplots.svg", base_width = 8, base_height = 2.5)
+```

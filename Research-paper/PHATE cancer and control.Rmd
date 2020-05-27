@@ -1,0 +1,176 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+solid_tumours <- c("BLCA", "BRCA", "CESC", "CHOL", "COAD", "ESCA",  "HNSC", "KICH", "KIRC", "KIRP", "LIHC", "LUAD", "LUSC", "PRAD", "STAD", "THCA", "UCEC")
+```
+
+```{r Programme definitions}
+#APOBEC, dormancy, exhaustion
+dormancy_list <- c("CD80", "CD274", "CXCL9", "CXCL10", "IRF7", "IFNAR1", "IFNAR2", "IFNG", "TNF", "STAT1", "TNFRSF1A", "PLAUR", "PTK2", "ITGA5", "ITGB1", "KDR", "VEGFA", "MMP9", "ZEB1")
+
+exhaustion_list <- c("CD244", "BATF", "PRDM1", "CD160", "ENTPD1", "ITGAE", "EOMES", "TBX21", "IFNG", "IL10", "IL12A", "EBI3", "STAT1", "STAT3", "STAT4", "IRF4", "LAG3", "NFATC1", "NFATC2", "NFATC4", "PDCD1", "CTLA4", "PROCR", "PDPN", "MAF", "PTPN11", "SPRY1", "SPRY2", "TIGIT", "CD226", "HAVCR2", "TRAF1")
+
+apobec_list <- c("AICDA", "APOBEC1", "APOBEC2", "APOBEC3A", "APOBEC3B", "APOBEC3C", "APOBEC3D", "APOBEC3F", "APOBEC3G", "APOBEC3H", "APOBEC4")
+
+#Vector of all the studied programmes (for convenience)
+all_genes_list <- unique(c(dormancy_list, exhaustion_list, apobec_list))
+```
+
+##PHATE clustering of the TCGA data
+###Download RNAseq data
+```{r}
+solid_tumours <- str_to_lower(solid_tumours)
+
+for (tumour in solid_tumours){
+  #Indicate progress
+  print(paste0(tumour, ": This is ", match(tumour, solid_tumours), " out of ", length(solid_tumours)))
+  
+  file_cancer <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga-t.txt.gz")
+  file_ctrl <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga.txt.gz")
+  
+  cancer <- read.delim(file_cancer)
+  ctrl <- read.delim(file_ctrl)
+  
+  rownames(cancer) <- cancer$Hugo_Symbol
+  cancer <- cancer[all_genes_list, c(-1, -2)]
+  
+  rownames(ctrl) <- ctrl$Hugo_Symbol
+  ctrl <- ctrl[all_genes_list, c(-1, -2)]
+  
+  cancer_type <- data.frame("Patient_long" = c(colnames(cancer), colnames(ctrl)))
+  cancer_type$Cancer <- as.character(tumour)
+  
+  if (tumour == solid_tumours[1]){
+    rnaseq_cancer <- cancer
+    rnaseq_ctrl <- ctrl
+    cancer_types <- cancer_type
+  } else {
+    rnaseq_cancer <- cbind(rnaseq_cancer, cancer)
+    rnaseq_ctrl <- cbind(rnaseq_ctrl, ctrl)
+    cancer_types <- rbind(cancer_types, cancer_type)
+  }
+}
+rm(tumour, file_cancer, file_ctrl, cancer, ctrl, cancer_type)
+
+#Remove outlier:
+rnaseq_cancer <- rnaseq_cancer[, -c(grep("TCGA.38.4625.", x = colnames(rnaseq_cancer)))]
+rnaseq_ctrl <- rnaseq_ctrl[, -c(grep("TCGA.38.4625.", x = colnames(rnaseq_ctrl)))]
+
+
+rnaseq_cancer <- log2(rnaseq_cancer+1)
+rnaseq_ctrl <- log2(rnaseq_ctrl+1)
+```
+
+###Remove samples with NA values
+These usually are in APOBEC4, which is non-functional protein and lowly expressed.
+```{r}
+raw_cancer <- rnaseq_cancer[, colSums(is.na(rnaseq_cancer)) == 0]
+raw_ctrl <- rnaseq_ctrl[, colSums(is.na(rnaseq_ctrl)) == 0]
+
+raw_both <- cbind(raw_ctrl, raw_cancer)
+```
+
+###Perform PHATE clustering and ComBat correction of batches
+```{r}
+reticulate::use_python("/Users/wojciechlason/opt/miniconda3/bin/python", required = T)
+reticulate::py_config()
+library(phateR)
+
+cancer_raw_phate <- phate(t(raw_cancer), seed = 2020)
+
+cancer_types$Cancer <- str_to_upper(cancer_types$Cancer)
+rownames(cancer_types) <- cancer_types$Patient_long
+batches <-  cancer_types[colnames(raw_cancer), ]#Batch information (which cancer the sample is from)
+
+p1 <- ggplot(cancer_raw_phate, aes(x=PHATE1, y=PHATE2, color=batches$Cancer)) +
+        geom_point() +
+        theme_pubr() +
+        labs(color = "TCGA Cancer") +
+        theme(legend.position = "right", legend.title = element_text(face = "bold")) + 
+        ggtitle("Before ComBat correction") +
+        theme(text = element_text(family = "Helvetica", size = 10))
+
+combat_cancer <- ComBat(dat = as.matrix(raw_cancer),
+                      batch = batches$Cancer,
+                      mod = NULL,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+
+cancer_combat_phate <- phate(t(combat_cancer), seed = 2020)
+
+p2 <- ggplot(cancer_combat_phate, aes(x=PHATE1, y=PHATE2, color=batches$Cancer)) +
+        geom_point() +
+        theme_pubr() +
+        labs(color = "TCGA Cancer") +
+        theme(legend.position = "right", legend.title = element_text(face = "bold")) +
+        ggtitle("After ComBat correction") +
+        theme(text = element_text(family = "Helvetica", size = 10))
+```
+
+###Perform PHATE clustering of both cancer and control samples
+```{r}
+batches_both <- cancer_types[colnames(raw_both), ]
+
+combat_both <- ComBat(dat = as.matrix(raw_both),
+                      batch = batches_both$Cancer,
+                      mod = NULL,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+
+both_combat_phate <- phate(t(combat_both), seed = 2020)
+
+expr_both <- data.frame(row.names = colnames(combat_both))
+expr_both$Patient_long <- rownames(expr_both)
+
+expr_both$mean_APOBEC <- apply(combat_both[apobec_list, ], function (x) mean(x), MARGIN = 2)
+expr_both$Dormancy <- apply(combat_both[dormancy_list, ], function (x) mean(x), MARGIN = 2)
+expr_both$Exhaustion <- apply(combat_both[exhaustion_list, ], function (x) mean(x), MARGIN = 2)
+expr_both$All <- apply(expr_both[, c("mean_APOBEC", "Dormancy", "Exhaustion")], function (x) mean(x), MARGIN = 1)
+
+expr_both$Sample_type <- NA
+expr_both[, "Sample_type"] <- "Control"
+expr_both[colnames(combat_cancer), "Sample_type"] <- "Cancer"
+
+patients_cancer <- expr_both[expr_both$Sample_type == "Cancer", "Patient_long"]
+patients_control <- expr_both[expr_both$Sample_type == "Control", "Patient_long"]
+
+dat1 <- as.data.frame(both_combat_phate)[patients_control, ]
+dat2 <- as.data.frame(both_combat_phate)[patients_cancer, ]
+
+col1 <- expr_both[patients_control, "All"]
+col2 <- expr_both[patients_cancer, "All"]
+
+p3 <- ggplot() +
+        geom_point(data= dat2, aes(x=PHATE1, y=PHATE2, fill=col2), shape=21, size=3, colour = "transparent") +  #Cancer
+        scale_color_gradient2(low = "darkorange2", midpoint = mean(col2), mid = "yellow ", high = "darkgreen") +
+        geom_point(data=dat1, aes(x=PHATE1, y=PHATE2, colour=col1), shape=16, size=3) +   #Control
+        scale_fill_gradient2(low = "red", midpoint = mean(col1), mid = "blue", high = "cyan") +
+        labs(colour="Control", fill="Cancer") +
+        theme_pubr() +
+        theme(legend.position = "right", legend.title = element_text(face = "bold", angle = 90)) + 
+        guides(colour = guide_colorbar(title.position = "left"), fill = guide_colorbar(title.position = "left")) +
+        ggtitle("All genes") +
+        theme(text = element_text(family = "Helvetica", size = 10))
+
+range(col1) #Controls
+range(col2) #Cancer
+
+# Test if there is difference in ranges
+t.test(col1, col2)
+```
+
+###Save generated plots as svg files
+```{r}
+save_plot(p1, filename = paste0(Sys.Date(), "_phate_no_combat.svg"), base_height = 3, base_width = 4)
+save_plot(p1 + theme(legend.position = "none", plot.title = element_blank()), filename = paste0(Sys.Date(), "_phate_no_combat_nolegend.svg"), base_height = 3, base_width = 4)
+
+save_plot(p2, filename = paste0(Sys.Date(), "_phate_combat_cancer.svg"), base_height = 3, base_width = 4)
+save_plot(p2 + theme(legend.position = "none", plot.title = element_blank()), filename = paste0(Sys.Date(), "_phate_combat_cancer_nolegend.svg"), base_height = 3, base_width = 4)
+
+save_plot(p3, filename = paste0(Sys.Date(), "_phate_combat_cancer_control.svg"), base_height = 3, base_width = 4)
+
+p1
+```
+

@@ -1,0 +1,515 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r Load packages}
+library(stringr)
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+library(RColorBrewer)
+
+library(plyr)
+library(sva)    #For ComBat correction
+library(corrplot)   #To make correlation plots
+```
+
+## Load data
+### Programme definitions
+```{r Define solid tumours}
+solid_tumours <- c("blca", "brca", "cesc", "chol", "coad", "esca",  "hnsc", "kich", "kirc", "kirp", "lihc", "luad", "lusc", "prad", "stad", "thca", "ucec")
+```
+
+```{r Programme definitions}
+#APOBEC, dormancy, exhaustion
+dormancy_list <- c("CD80", "CD274", "CXCL9", "CXCL10", "IRF7", "IFNAR1", "IFNAR2", "IFNG", "TNF", "STAT1", "TNFRSF1A", "PLAUR", "PTK2", "ITGA5", "ITGB1", "KDR", "VEGFA", "MMP9", "ZEB1")
+
+exhaustion_list <- c("CD244", "BATF", "PRDM1", "CD160", "ENTPD1", "ITGAE", "EOMES", "TBX21", "IFNG", "IL10", "IL12A", "EBI3", "STAT1", "STAT3", "STAT4", "IRF4", "LAG3", "NFATC1", "NFATC2", "NFATC4", "PDCD1", "CTLA4", "PROCR", "PDPN", "MAF", "PTPN11", "SPRY1", "SPRY2", "TIGIT", "CD226", "HAVCR2", "TRAF1")
+
+apobec_list <- c("AICDA", "APOBEC1", "APOBEC2", "APOBEC3A", "APOBEC3B", "APOBEC3C", "APOBEC3D", "APOBEC3F", "APOBEC3G", "APOBEC3H", "APOBEC4")
+
+#Vector of all the studied programmes (for convenience)
+all_genes_list <- unique(c(dormancy_list, exhaustion_list, apobec_list))
+
+#Hypoxia
+load("hypoxia.RData")
+hypoxia <- list("Buffa" = hypoxia_buffa, "Winter" = hypoxia_winter, "West" = hypoxia_west)
+```
+
+```{r Create vector of COSMIC database driver genes}
+COSMIC <- read.csv("~/GitHub/BIOL0041 Immune dormancy/COSMIC.csv")
+cosmic_list <- as.character(COSMIC$Gene.Symbol)
+rm(COSMIC)
+#Remove the genes which are not found in the expression dataset
+cosmic_list <- setdiff(cosmic_list, c("AFDN", "IGH", "IGK", "IGL", "KNL1", "MRTFA", "NSD2", "NSD3", "TENT5C", "TRA", "TRB", "TRD", "WDCP"))
+```
+
+### RNAseq data
+```{r Download RNAseq data for programmes}
+solid_tumours <- str_to_lower(solid_tumours)
+
+for (tumour in solid_tumours){
+  #Indicate progress
+  print(paste0(tumour, ": This is ", match(tumour, solid_tumours), " out of ", length(solid_tumours)))
+  
+  file_cancer <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga-t.txt.gz")
+  cancer <- read.delim(file_cancer)
+  
+  rownames(cancer) <- cancer$Hugo_Symbol
+  cancer <- cancer[all_genes_list, c(-1, -2)]
+  
+  cancer_type <- data.frame("Patient_long" = colnames(cancer))
+  cancer_type$Cancer <- as.character(tumour)
+  
+  if (tumour == solid_tumours[1]){
+    rnaseq_cancer <- cancer
+    cancer_types <- cancer_type
+  } else {
+    rnaseq_cancer <- cbind(rnaseq_cancer, cancer)
+    cancer_types <- rbind(cancer_types, cancer_type)
+  }
+}
+rm(tumour, file_cancer, cancer, cancer_type)
+
+#Remove outlier:
+rnaseq_cancer <- rnaseq_cancer[, -c(grep("TCGA.38.4625.", x = colnames(rnaseq_cancer)))]
+
+#Normalise
+rnaseq_cancer <- log2(rnaseq_cancer+1)
+```
+
+
+### COMBAT correction
+```{r Correcting for tissue effects using combat}
+#Create adjustment matrix
+combat_df <- rnaseq_cancer[, colSums(is.na(rnaseq_cancer)) == 0]
+
+rownames(cancer_types) <- cancer_types$Patient_long
+batches <-  cancer_types[colnames(combat_df), ] #Batch information (which cancer the sample is from)
+
+combat_cancer <- ComBat(dat = as.matrix(combat_df),
+                      batch = batches$Cancer,
+                      mod = NULL,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+```
+
+
+### PHATE clustering
+```{r PHATE for cancer}
+reticulate::use_python("/Users/wojciechlason/opt/miniconda3/bin/python", required = T)
+reticulate::py_config()
+library(phateR)
+
+cancer_phate <- phate(t(combat_cancer), seed = 2020)
+#saveRDS(cancer_phate, "cancer_phate.rds")
+
+ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, color = batches$Cancer)) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  guides(color = guide_legend(override.aes = list(size=5)))
+
+expr <- data.frame(row.names = colnames(combat_cancer))
+expr$mean_APOBEC <- apply(combat_cancer[apobec_list, ], function (x) mean(x), MARGIN = 2)
+expr$Dormancy <- apply(combat_cancer[dormancy_list, ], function (x) mean(x), MARGIN = 2)
+expr$Exhaustion <- apply(combat_cancer[exhaustion_list, ], function (x) mean(x), MARGIN = 2)
+expr$All <- apply(expr[, c("mean_APOBEC", "Dormancy", "Exhaustion")], function (x) mean(x), MARGIN = 1)
+```
+
+## Make Venn diagram
+```{r}
+length(intersect(hypoxia_buffa, hypoxia_west))
+length(intersect(hypoxia_buffa, hypoxia_winter))
+length(intersect(hypoxia_winter, hypoxia_west))
+length(intersect(hypoxia_winter, intersect(hypoxia_buffa, hypoxia_west)))
+```
+
+
+## Make PHATE overlays
+### RNAseq data
+```{r Download hypoxia data for hypoxia (visualization purposes)}
+for (tumour in solid_tumours){
+  #Indicate progress
+  print(paste0("HYPOXIA: ", str_to_upper(tumour), ": This is ", match(tumour, solid_tumours), " out of ", length(solid_tumours)))
+  
+  file_cancer <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga-t.txt.gz")
+  
+  cancer <- read.delim(file_cancer)
+  rownames(cancer) <- cancer$Hugo_Symbol
+  cancer <- cancer[unlist(hypoxia), c(-1, -2)]
+  
+  cancer_type <- data.frame("Patient_long" = colnames(cancer))
+  cancer_type$Cancer <- as.character(tumour)
+  
+  if (tumour == solid_tumours[1]){
+    hypoxia_cancer <- cancer
+    cancer_types <- cancer_type
+  } else {
+    hypoxia_cancer <- cbind(hypoxia_cancer, cancer)
+    cancer_types <- rbind(cancer_types, cancer_type)
+  }
+}
+rm(tumour, file_cancer, cancer, cancer_type)
+
+# Remove outlier
+hypoxia_cancer <- hypoxia_cancer[, -c(grep("TCGA.38.4625.", x = colnames(hypoxia_cancer)))]
+# Normalize
+hypoxia_cancer <- log2(hypoxia_cancer+1)
+```
+
+
+### Hypoxia expression on PHATE plots using all genes
+```{r}
+hypoxia_scores <- data.frame(row.names = colnames(hypoxia_cancer))
+hypoxia_scores$West <- apply(hypoxia_cancer[hypoxia_west, ], function (x) mean(x), MARGIN = 2)
+#Margin is 2 and selecting rows, because in hypoxia_cancer columns are patients, but in hypoxia_scores, rows are patients
+hypoxia_scores$Winter <- apply(hypoxia_cancer[hypoxia_winter, ], function (x) mean(x), MARGIN = 2)
+hypoxia_scores$Buffa <- apply(hypoxia_cancer[hypoxia_buffa, ], function (x) mean(x), MARGIN = 2)
+
+for(sig_name in names(hypoxia)){
+p <- ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2,
+                         colour = hypoxia_scores[which(rownames(hypoxia_scores) %in% colnames(combat_cancer)), sig_name])) +
+  geom_point() +
+  theme_pubr(legend = "right") +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  theme(legend.position = "right", legend.title = element_text(face = "bold", angle = 90)) +
+  scale_color_gradient(low = "blue", high = "orange") +
+  ggtitle(paste0("Hypoxia signature: ", sig_name)) +
+  labs(colour = "log2(Expression)") +
+  guides(colour = guide_colorbar(title.position = "left")) +
+  theme(text = element_text(family = "Helvetica", size = 10))
+
+save_plot(plot = p, filename = paste(Sys.Date(), "PHATE_hypoxia", sig_name, "signature.pdf", sep = "_"), base_height = 3, base_width = 4)
+save_plot(plot = p, filename = paste(Sys.Date(), "PHATE_hypoxia", sig_name, "signature.svg", sep = "_"), base_height = 3, base_width = 4)
+print(p)
+}
+```
+
+
+## Clustering on hypoxia genes (Buffa)
+
+### PHATE clustering
+```{r}
+#Create adjustment matrix
+hypoxia_df <- hypoxia_cancer[, colSums(is.na(hypoxia_cancer)) == 0]
+
+rownames(cancer_types) <- cancer_types$Patient_long
+batches <-  cancer_types[colnames(hypoxia_df), ] #Batch information (which cancer the sample is from)
+
+combat_hypoxia <- ComBat(dat = as.matrix(hypoxia_df),
+                      batch = batches$Cancer,
+                      mod = NULL,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+
+hypoxia_phate <- phate(t(hypoxia_cancer[hypoxia_buffa, ]), seed = 2020)
+hypoxia_clusters <- as.factor(cluster_phate(hypoxia_phate, k=2, seed=2020))
+ggplot(hypoxia_phate, aes(x=PHATE1, y=PHATE2, color = hypoxia_clusters)) +
+  geom_point()
+
+hypoxia_clusters <- mapvalues(hypoxia_clusters, from = 0:1, to = 1:2)
+```
+
+
+### Visualisation
+```{r}
+p1 <- ggplot(hypoxia_phate, aes(x=PHATE1, y=PHATE2, color = hypoxia_clusters)) +
+      geom_point() +
+      scale_color_manual(values = c("#F79835", "#AA3EBA")) +
+      theme_pubr(legend = "none") +
+      theme(text = element_text(family = "Helvetica", size = 10))
+
+hypoxia_scores <- cbind(hypoxia_scores, "Cluster" = hypoxia_clusters)
+
+p2 <- ggboxplot(hypoxia_scores, x = "Cluster", y = "Buffa",
+          color = "Cluster", palette =c("#F79835", "#AA3EBA")) + 
+          stat_compare_means(comparisons = list(1:2), label = "p.signif") + # Add pairwise comparisons p-value
+          stat_compare_means(label.y = 13) +
+          theme(legend.position = "none") +
+          theme(text = element_text(family = "Helvetica", size = 10))
+
+save_plot(p1, filename = "PHATE_Buffa.svg", base_height = 3, base_width = 4)
+save_plot(p2, filename = "PHATE_Buffa_boxplot.svg", base_height = 3, base_width = 4)
+```
+
+
+## Fisher's exact test
+
+### Function definition
+```{r}
+fisher.WL <- function(data, genes, to_test, to_compare){
+  
+        for (tail in to_test){
+          
+              for (gene in genes){
+              if(!(gene %in% colnames(data))){
+                next()
+              }
+              
+              fisher_data <- data[, c(gene, "Cluster")]
+              
+              fisher_matrix <- matrix(c(length(which(fisher_data[, gene] == 1 & fisher_data[, "Cluster"] == tail)),
+                                        length(which(fisher_data[, gene] == 0 & fisher_data[, "Cluster"] == tail)),
+                                        length(which(fisher_data[, gene] == 1 & fisher_data[, "Cluster"] %in% to_compare)),
+                                        length(which(fisher_data[, gene] == 0 & fisher_data[, "Cluster"] %in% to_compare))), nrow = 2, byrow = TRUE)
+              
+              rownames(fisher_matrix) <- c("tail", "rest")
+              colnames(fisher_matrix) <- c("MU", "WT")
+              
+              f <- fisher.test(fisher_matrix)
+              
+              if (gene == cosmic_list[1] && tail == to_test[1]){
+              l <- length(to_test)
+              results <- vector(mode = "list", length = l)
+              for (i in 1:l){
+                results[[i]] <- data.frame()
+              }
+              }
+              n <- match(tail, to_test)
+                results[[n]][gene, "p_val"] <- f$p.value
+                results[[n]][gene, "odds"] <- f$estimate
+                results[[n]][gene, "extreme_WT"] <- fisher_matrix["tail", "WT"]
+                results[[n]][gene, "extreme_MU"] <- fisher_matrix["tail", "MU"]
+                results[[n]][gene, "rest_WT"] <- fisher_matrix["rest", "WT"]
+                results[[n]][gene, "rest_MU"] <- fisher_matrix["rest", "MU"]
+                results[[n]][gene, "gene"] <- gene
+                results[[n]][gene, "extreme"] <- tail
+              }
+        }
+        
+        results_all <- bind_rows(results)
+        results_all$p_adj <- p.adjust(results_all$p_val, method = "BH")
+        results_all <- subset(results_all, p_adj<0.05)
+        results_all$p_adj_star <- symnum(results_all$p_adj, cutpoints = c(0,0.0001,0.001,0.01,0.05,1), symbols = c("****","***","**","*","ns"))
+        
+        return(results_all)
+}
+```
+
+### Perform Fisher analysis
+
+## MAF data
+```{r Download MAF fata (mutations and predicted results)}
+solid_tumours <- str_to_upper(solid_tumours)
+genes_to_save <- unique(c(all_genes_list, cosmic_list))
+
+maf_all <- list()
+for (tumour in solid_tumours){
+  print(paste0(tumour, ": This is ", which(tumour == solid_tumours), " out of ", length(solid_tumours)))
+  df.maf <- GDCquery_Maf(tumour, pipelines = "mutect2")
+  df.maf.short <- df.maf[,c("Tumor_Sample_Barcode",
+                          "Hugo_Symbol","Chromosome",
+                          "Start_Position","End_Position",
+                          "Variant_Classification",
+                          "Variant_Type",
+                          "Reference_Allele",
+                          "Tumor_Seq_Allele1",
+                          "Tumor_Seq_Allele2",
+                          "One_Consequence",
+                          "Consequence",
+                          "SIFT","PolyPhen")]
+  df.maf.short$Cancer <- as.character(tumour)
+  df.maf.short <- subset(df.maf.short, Hugo_Symbol %in% genes_to_save)
+  
+  maf_all[[tumour]] <- df.maf.short
+}
+save(maf_all, file = paste0(Sys.Date(), "_maf_all.RData"))
+
+maf_all <- bind_rows(maf_all)
+
+maf_all$Patient_short <- sapply(maf_all$Tumor_Sample_Barcode,
+                             function(x) paste(str_split(x, "-", simplify = T)[1:4], collapse = "-"))
+
+```
+
+
+```{r}
+maf_strict <- maf_all[ which((maf_all$Variant_Classification
+                                       %in% c("Missense_Mutation",
+                                              "Nonsense_Mutation",
+                                              "Nonstop_Mutation",
+                                              "Frameshift_Deletion",
+                                              "Frameshift_Insertion",
+                                              "Inframe_Insertion",
+                                              "Inframe_Deletion")) &
+                                   grepl("01A", maf_all$Patient_short) &
+                                  (grepl("deleterious", maf_all$SIFT) |
+                                   grepl("damaging", maf_all$PolyPhen))),
+                                       ]
+
+
+maf_lenient <- maf_all[ which(maf_all$Variant_Classification
+                                      %in% c("Missense_Mutation",
+                                             "Nonsense_Mutation",
+                                             "Nonstop_Mutation",
+                                             "Frameshift_Deletion",
+                                             "Frameshift_Insertion",
+                                             "Inframe_Insertion",
+                                             "Inframe_Deletion")) &
+                                   grepl("01A", maf_all$Patient_short),
+                                        ]
+rm(maf_all)
+
+maf_strict$Mutation <- 1      #Gives every patient-gene mutation value 1
+maf_strict <- dcast(maf_strict, value.var = "Mutation",
+                        formula = Tumor_Sample_Barcode+Patient_short+Cancer~Hugo_Symbol,
+                        fun.aggregate = function(x) ifelse(sum(x)>0, yes = 1, no = 0))
+                        #Because aggregation function sums all the values, we give 1 if sum>0,
+                        #and 0 if there are no mutations
+
+maf_lenient$Mutation <- 1
+maf_lenient <- dcast(maf_lenient, value.var = "Mutation",
+                        formula = Tumor_Sample_Barcode+Patient_short+Cancer~Hugo_Symbol,
+                        fun.aggregate = function(x) ifelse(sum(x)>0, yes = 1, no = 0))
+```
+
+### Make fisher dataset
+```{r}
+fisher_hypoxia <- merge(x = hypoxia_scores[, c("Cluster", "Patient_short")], y = maf_lenient, by = "Patient_short", all = FALSE)
+
+fisher_lenient <- fisher.WL(data = fisher_hypoxia,
+          genes = cosmic_list,
+          to_test = "1",
+          to_compare = "2")
+write.csv(fisher_lenient, paste0(Sys.Date(), "_hypoxia_k_2_lenient.csv"))
+
+fisher_hypoxia_strict <- merge(x = hypoxia_scores[, c("Cluster", "Patient_short")], y = maf_strict, by = "Patient_short", all = FALSE)
+
+fisher_strict <- fisher.WL(data = fisher_hypoxia_strict,
+          genes = cosmic_list,
+          to_test = "1",
+          to_compare = "2")
+write.csv(fisher_strict, paste0(Sys.Date(), "_hypoxia_k_2_strict.csv"))
+```
+
+
+### Visualise results
+```{r}
+pathways <- read.delim("hypoxia_lenient_pathways.txt")
+pathways <- pathways[pathways$source == "INOH", ]
+pathways$log <- -log(pathways$q.value, base = 10)
+
+
+p <- ggplot(top_n(pathways, n = 15, wt = log), aes(x = reorder(pathway, log), y = log)) +
+  geom_col(fill = "#F79835") +
+  coord_flip() +
+  labs(x = "Pathway name", y = "-log10(p value)") +
+  theme_pubr(legend = "none") +
+  theme(text = element_text(family = "Helvetica", size = 10))
+
+save_plot(p, filename = paste0(Sys.Date(), "_pathways.svg"), base_height = 3, base_width = 4)
+```
+
+
+## Correlation with mutational signatures
+
+### Load calculations made on the cluster
+```{r}
+mutect2 <- readRDS(file = "mutect2.rds")
+
+mutect2_all <- do.call(rbind, c(mutect2[1:17], make.row.names=T))
+rm(mutect2) #Remove the big file
+
+mutect2_all$Patient_short <- sapply(rownames(mutect2_all),
+                             function(x) paste(str_split(x, "\\.", simplify = T)[2])) #Remove the prefix, eg. BRCA.TCGA...
+mutect2_all$Patient_short <- sapply(mutect2_all$Patient_short,
+                             function(x) paste(str_split(x, "-", simplify = T)[1:4], collapse = "-")) #Make a short barcode
+
+
+hypoxia_scores$Patient_short <- sapply(rownames(hypoxia_scores),
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-")) #Add barcode column to expression matrix
+```
+
+
+### Make correlation matrix
+```{r}
+mutect2_corr <- merge(hypoxia_scores, mutect2_all, by = "Patient_short")  #Create matrix to calculate correlation
+SBS <- grep(colnames(mutect2_corr), pattern = "^SBS", value = T)  #Vector with names of SBS signatures (COSMIC v3)
+
+SBS_matrix <- cor(mutect2_corr[, c(SBS, "Buffa", "West", "Winter")])
+p_matrix <- cor.mtest(mutect2_corr[, c(SBS, "Buffa", "West", "Winter")])$p
+dimnames(p_matrix) <- dimnames(SBS_matrix)
+```
+
+
+### Make plots
+```{r Horizontal version}
+cols <- colorRampPalette(rev(c("#F79835", "white", "#AA3EBA")))
+indices <- list(c(1, 22), c(23, 44), c(44, 65), c(44, 65))  #Number 44 duplicated to make the plots the same size
+
+pdf(paste0(Sys.Date(), "_mutect2_corr_hypoxia.pdf"), width = 4, height = 1)
+for(i in 1:4){
+start <- indices[[i]][1]
+end <- indices[[i]][2]
+
+if (i<=3){
+corrplot(SBS_matrix[c("Buffa", "West", "Winter"), SBS[start:end]],
+         method = "color",
+         insig = "label_sig",
+         p.mat = p_matrix[c("Buffa", "West", "Winter"), SBS[start:end]],
+         cl.pos = "n",
+         cl.cex = 0.7,
+         col = cols(100),
+         pch.cex = 0.8,
+         is.corr = F,
+         tl.col = "black",
+         tl.cex = 0.7)
+} else {
+corrplot(SBS_matrix[c("Buffa", "West", "Winter"), SBS[start:end]],
+         method = "color",
+         insig = "label_sig",
+         p.mat = p_matrix[c("Buffa", "West", "Winter"), SBS[start:end]],
+         cl.pos = "b",
+         cl.ratio = 1,
+         cl.length = 7,
+         cl.lim = c(-0.15, 0.15),
+         cl.cex = 0.7,
+         col = cols(100),
+         pch.cex = 0.8,
+         is.corr = F,
+         tl.col = "black",
+         tl.cex = 0.7)
+}
+}
+dev.off()
+```
+
+```{r Vertical version}
+indices <- list(c(1, 13), c(14, 26), c(27, 39), c(40, 52), c(53, 65), c(53, 65))
+pdf(paste0(Sys.Date(), "_mutect2_corr_hypoxia_vertical.pdf"), width = 2, height = 3)
+for(i in 1:6){
+start <- indices[[i]][1]
+end <- indices[[i]][2]
+
+if (i<=5){
+corrplot(SBS_matrix[SBS[start:end], c("Buffa", "West", "Winter")],
+         method = "color",
+         insig = "label_sig",
+         p.mat = p_matrix[SBS[start:end], c("Buffa", "West", "Winter")],
+         cl.pos = "n",
+         cl.cex = 0.7,
+         col = cols(100),
+         pch.cex = 0.8,
+         is.corr = F,
+         tl.col = "black",
+         tl.cex = 0.7)
+} else {
+corrplot(SBS_matrix[SBS[start:end], c("Buffa", "West", "Winter")],
+         method = "color",
+         insig = "label_sig",
+         p.mat = p_matrix[SBS[start:end], c("Buffa", "West", "Winter")],
+         cl.pos = "b",
+         cl.ratio = 1,
+         cl.length = 7,
+         cl.lim = c(-0.15, 0.15),
+         cl.cex = 0.7,
+         col = cols(100),
+         pch.cex = 0.8,
+         is.corr = F,
+         tl.col = "black",
+         tl.cex = 0.7)
+}
+}
+dev.off()
+```

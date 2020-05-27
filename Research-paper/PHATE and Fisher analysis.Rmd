@@ -1,0 +1,620 @@
+---
+title: "R Notebook"
+output: html_notebook
+author: Wojciech Lason
+---
+```{r}
+library(dplyr)
+library(stringr)
+library(reshape2)
+
+library(sva)
+library(TCGAbiolinks)
+
+library(ggplot2)
+library(ggpubr)
+library(cowplot)
+```
+
+
+##Prepare the data
+```{r Define solid tumours}
+solid_tumours <- c("blca", "brca", "cesc", "chol", "coad", "esca",  "hnsc", "kich", "kirc", "kirp", "lihc", "luad", "lusc", "prad", "stad", "thca", "ucec")
+```
+
+```{r Specify genes of interest}
+# I removed the genes which were not found in BRCA patients - I used BRCA artificially, the genes are the same for all the cancer types
+# The only gene missing was INFB1, originally in the "Dormancy" list
+dormancy_list <- c("CD80", "CD274", "CXCL9", "CXCL10", "IRF7", "IFNAR1", "IFNAR2", "IFNG", "TNF", "STAT1", "TNFRSF1A", "PLAUR", "PTK2", "ITGA5", "ITGB1", "KDR", "VEGFA", "MMP9", "ZEB1")
+
+exhaustion_list <- c("CD244", "BATF", "PRDM1", "CD160", "ENTPD1", "ITGAE", "EOMES", "TBX21", "IFNG", "IL10", "IL12A", "EBI3", "STAT1", "STAT3", "STAT4", "IRF4", "LAG3", "NFATC1", "NFATC2", "NFATC4", "PDCD1", "CTLA4", "PROCR", "PDPN", "MAF", "PTPN11", "SPRY1", "SPRY2", "TIGIT", "CD226", "HAVCR2", "TRAF1")
+
+apobec_list <- c("AICDA", "APOBEC1", "APOBEC2", "APOBEC3A", "APOBEC3B", "APOBEC3C", "APOBEC3D", "APOBEC3F", "APOBEC3G", "APOBEC3H", "APOBEC4")
+
+#Vector of all the studied programmes (for convenience)
+all_genes_list <- unique(c(dormancy_list, exhaustion_list, apobec_list))
+```
+
+```{r Create vector of COSMIC database driver genes}
+COSMIC <- read.csv("~/GitHub/BIOL0041 Immune dormancy/COSMIC.csv")
+cosmic_list <- as.character(COSMIC$Gene.Symbol)
+rm(COSMIC)
+#Remove the genes which are not found in the expression dataset
+cosmic_list <- setdiff(cosmic_list, c("AFDN", "IGH", "IGK", "IGL", "KNL1", "MRTFA", "NSD2", "NSD3", "TENT5C", "TRA", "TRB", "TRD", "WDCP"))
+```
+
+##Import expression data and perform COMBAT correction
+
+###RNAseq data
+```{r Download RNAseq data for programmes}
+solid_tumours <- str_to_lower(solid_tumours)
+
+for (tumour in solid_tumours){
+  #Indicate progress
+  print(paste0(tumour, ": This is ", match(tumour, solid_tumours), " out of ", length(solid_tumours)))
+  
+  file_cancer <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga-t.txt.gz")
+  cancer <- read.delim(file_cancer)
+  
+  rownames(cancer) <- cancer$Hugo_Symbol
+  cancer <- cancer[all_genes_list, c(-1, -2)]
+  
+  cancer_type <- data.frame("Patient_long" = colnames(cancer))
+  cancer_type$Cancer <- as.character(tumour)
+  
+  if (tumour == solid_tumours[1]){
+    rnaseq_cancer <- cancer
+    cancer_types <- cancer_type
+  } else {
+    rnaseq_cancer <- cbind(rnaseq_cancer, cancer)
+    cancer_types <- rbind(cancer_types, cancer_type)
+  }
+}
+rm(tumour, file_cancer, cancer, cancer_type)
+
+#Remove outlier:
+rnaseq_cancer <- rnaseq_cancer[, -c(grep("TCGA.38.4625.", x = colnames(rnaseq_cancer)))]
+
+#Normalise
+rnaseq_cancer <- log2(rnaseq_cancer+1)
+```
+
+###COMBAT correction
+```{r Correcting for tissue effects using combat}
+#Create adjustment matrix
+combat_df <- rnaseq_cancer[, colSums(is.na(rnaseq_cancer)) == 0]
+
+rownames(cancer_types) <- cancer_types$Patient_long
+batches <-  cancer_types[colnames(combat_df), ] #Batch information (which cancer the sample is from)
+
+combat_cancer <- ComBat(dat = as.matrix(combat_df),
+                      batch = batches$Cancer,
+                      mod = NULL,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+```
+
+### MAF data
+```{r Download MAF fata (mutations and predicted results)}
+solid_tumours <- str_to_upper(solid_tumours)
+genes_to_save <- unique(c(all_genes_list, cosmic_list))
+
+maf_all <- list()
+for (tumour in solid_tumours){
+  print(paste0(tumour, ": This is ", which(tumour == solid_tumours), " out of ", length(solid_tumours)))
+  df.maf <- GDCquery_Maf(tumour, pipelines = "mutect2")
+  df.maf.short <- df.maf[,c("Tumor_Sample_Barcode",
+                          "Hugo_Symbol","Chromosome",
+                          "Start_Position","End_Position",
+                          "Variant_Classification",
+                          "Variant_Type",
+                          "Reference_Allele",
+                          "Tumor_Seq_Allele1",
+                          "Tumor_Seq_Allele2",
+                          "One_Consequence",
+                          "Consequence",
+                          "SIFT","PolyPhen")]
+  df.maf.short$Cancer <- as.character(tumour)
+  df.maf.short <- subset(df.maf.short, Hugo_Symbol %in% genes_to_save)
+  
+  maf_all[[tumour]] <- df.maf.short
+}
+save(maf_all, file = paste0(Sys.Date(), "_maf_all.RData"))
+
+maf_all <- bind_rows(maf_all)
+
+maf_all$Patient_short <- sapply(maf_all$Tumor_Sample_Barcode,
+                             function(x) paste(str_split(x, "-", simplify = T)[1:4], collapse = "-"))
+
+```
+
+
+```{r}
+maf_strict <- maf_all[ which((maf_all$Variant_Classification
+                                       %in% c("Missense_Mutation",
+                                              "Nonsense_Mutation",
+                                              "Nonstop_Mutation",
+                                              "Frameshift_Deletion",
+                                              "Frameshift_Insertion",
+                                              "Inframe_Insertion",
+                                              "Inframe_Deletion")) &
+                                   grepl("01A", maf_all$Patient_short) &
+                                  (grepl("deleterious", maf_all$SIFT) |
+                                   grepl("damaging", maf_all$PolyPhen))),
+                                       ]
+
+
+maf_lenient <- maf_all[ which(maf_all$Variant_Classification
+                                      %in% c("Missense_Mutation",
+                                             "Nonsense_Mutation",
+                                             "Nonstop_Mutation",
+                                             "Frameshift_Deletion",
+                                             "Frameshift_Insertion",
+                                             "Inframe_Insertion",
+                                             "Inframe_Deletion")) &
+                                   grepl("01A", maf_all$Patient_short),
+                                        ]
+rm(maf_all)
+
+maf_strict$Mutation <- 1      #Gives every patient-gene mutation value 1
+maf_strict <- dcast(maf_strict, value.var = "Mutation",
+                        formula = Tumor_Sample_Barcode+Patient_short+Cancer~Hugo_Symbol,
+                        fun.aggregate = function(x) ifelse(sum(x)>0, yes = 1, no = 0))
+                        #Because aggregation function sums all the values, we give 1 if sum>0,
+                        #and 0 if there are no mutations
+
+maf_lenient$Mutation <- 1
+maf_lenient <- dcast(maf_lenient, value.var = "Mutation",
+                        formula = Tumor_Sample_Barcode+Patient_short+Cancer~Hugo_Symbol,
+                        fun.aggregate = function(x) ifelse(sum(x)>0, yes = 1, no = 0))
+```
+
+
+## Define the function for Fisher's exact test
+```{r}
+fisher.WL <- function(data, genes, to_test, to_compare){
+  
+        for (tail in to_test){
+          
+              for (gene in genes){
+              if(!(gene %in% colnames(data))){
+                next()
+              }
+              
+              fisher_data <- data[, c(gene, "Cluster")]
+              
+              fisher_matrix <- matrix(c(length(which(fisher_data[, gene] == 1 & fisher_data[, "Cluster"] == tail)),
+                                        length(which(fisher_data[, gene] == 0 & fisher_data[, "Cluster"] == tail)),
+                                        length(which(fisher_data[, gene] == 1 & fisher_data[, "Cluster"] %in% to_compare)),
+                                        length(which(fisher_data[, gene] == 0 & fisher_data[, "Cluster"] %in% to_compare))), nrow = 2, byrow = TRUE)
+              
+              rownames(fisher_matrix) <- c("tail", "rest")
+              colnames(fisher_matrix) <- c("MU", "WT")
+              
+              f <- fisher.test(fisher_matrix)
+              
+              if (gene == cosmic_list[1] && tail == to_test[1]){
+              l <- length(to_test)
+              results <- vector(mode = "list", length = l)
+              for (i in 1:l){
+                results[[i]] <- data.frame()
+              }
+              }
+              n <- match(tail, to_test)
+                results[[n]][gene, "p_val"] <- f$p.value
+                results[[n]][gene, "odds"] <- f$estimate
+                results[[n]][gene, "extreme_WT"] <- fisher_matrix["tail", "WT"]
+                results[[n]][gene, "extreme_MU"] <- fisher_matrix["tail", "MU"]
+                results[[n]][gene, "rest_WT"] <- fisher_matrix["rest", "WT"]
+                results[[n]][gene, "rest_MU"] <- fisher_matrix["rest", "MU"]
+                results[[n]][gene, "gene"] <- gene
+                results[[n]][gene, "extreme"] <- tail
+              }
+        }
+        
+        results_all <- bind_rows(results)
+        results_all$p_adj <- p.adjust(results_all$p_val, method = "BH")
+        results_all <- subset(results_all, p_adj<0.05)
+        results_all$p_adj_star <- symnum(results_all$p_adj, cutpoints = c(0,0.0001,0.001,0.01,0.05,1), symbols = c("****","***","**","*","ns"))
+        
+        return(results_all)
+}
+```
+
+
+## Visualise the PHATE clusters
+### APOBEC + Dormancy + Exhaustion
+```{r PHATE for cancer}
+reticulate::use_python("/Users/wojciechlason/opt/miniconda3/bin/python", required = T)
+reticulate::py_config()
+library(phateR)
+
+cancer_phate <- phate(t(combat_cancer), seed = 2020)
+clusters <- data.frame("Cluster" = cluster_phate(cancer_phate, k=3, seed=2020), "Patient_long" = rownames(cancer_phate$embedding))
+
+saveRDS(cancer_phate, "cancer_phate.rds")
+saveRDS(clusters, "k_3_clusters.rds")
+
+ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, color = batches$Cancer)) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  guides(color = guide_legend(override.aes = list(size=5)))
+
+expr <- data.frame(row.names = colnames(combat_cancer))
+expr$mean_APOBEC <- apply(combat_cancer[apobec_list, ], function (x) mean(x), MARGIN = 2)
+expr$Dormancy <- apply(combat_cancer[dormancy_list, ], function (x) mean(x), MARGIN = 2)
+expr$Exhaustion <- apply(combat_cancer[exhaustion_list, ], function (x) mean(x), MARGIN = 2)
+expr$All <- apply(expr[, c("mean_APOBEC", "Dormancy", "Exhaustion")], function (x) mean(x), MARGIN = 1)
+```
+
+
+```{r Make plots}
+p1 <- ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, colour = expr$mean_APOBEC)) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  scale_color_gradient2(low = "red", midpoint = mean(expr$mean_APOBEC), mid = "blue", high = "green") +
+  ggtitle("APOBEC genes") +
+  theme_pubr() +
+  theme(legend.position = "right", legend.title = element_text(face = "bold", angle = 90)) +
+  labs(colour = "log2(Expression)") +
+  guides(colour = guide_colorbar(title.position = "left")) +
+  theme(text = element_text(family = "Helvetica", size = 10))
+
+p2 <- ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, colour = expr$Exhaustion)) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  scale_color_gradient2(low = "red", midpoint = mean(expr$Exhaustion), mid = "blue", high = "green") +
+  ggtitle("Exhaustion programme") +
+  theme_pubr() +
+  theme(legend.position = "right", legend.title = element_text(face = "bold", angle = 90)) +
+  labs(colour = "log2(Expression)") +
+  guides(colour = guide_colorbar(title.position = "left")) +
+  theme(text = element_text(family = "Helvetica", size = 10))
+
+p3 <- ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, colour = expr$Dormancy)) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  scale_color_gradient2(low = "red", midpoint = mean(expr$Dormancy), mid = "blue", high = "green") +
+  ggtitle("Dormancy programme") +
+  theme_pubr() +
+  theme(legend.position = "right", legend.title = element_text(face = "bold", angle = 90)) +
+  labs(colour = "log2(Expression)") +
+  guides(colour = guide_colorbar(title.position = "left")) +
+  theme(text = element_text(family = "Helvetica", size = 10))
+
+p4 <- ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, colour = expr$All)) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  scale_color_gradient2(low = "red", midpoint = mean(expr$All), mid = "blue", high = "green") +
+  ggtitle("All genes") +
+  theme_pubr() +
+  theme(legend.position = "right", legend.title = element_text(face = "bold", angle = 90)) +
+  labs(colour = "log2(Expression)") +
+  guides(colour = guide_colorbar(title.position = "left")) +
+  theme(text = element_text(family = "Helvetica", size = 10))
+
+save_plot(p1, filename = paste0(Sys.Date(), "_APOBEC_genes_phate.pdf"), base_height = 3, base_width = 4)
+save_plot(p2, filename = paste0(Sys.Date(), "_exhaustion_phate.pdf"), base_height = 3, base_width = 4)
+save_plot(p3, filename = paste0(Sys.Date(), "_dormancy_phate.pdf"), base_height = 3, base_width = 4)
+save_plot(p4, filename = paste0(Sys.Date(), "_all_progs_phate.pdf"), base_height = 3, base_width = 4)
+
+save_plot(p1, filename = paste0(Sys.Date(), "_APOBEC_genes_phate.svg"), base_height = 3, base_width = 4)
+save_plot(p2, filename = paste0(Sys.Date(), "_exhaustion_phate.svg"), base_height = 3, base_width = 4)
+save_plot(p3, filename = paste0(Sys.Date(), "_dormancy_phate.svg"), base_height = 3, base_width = 4)
+save_plot(p4, filename = paste0(Sys.Date(), "_all_progs_phate.svg"), base_height = 3, base_width = 4)
+```
+
+```{r K means clustering on PHATE parameters}
+#cancer_phate is the object with clustering on all the programmes
+clusters <- as.vector(cluster_phate(cancer_phate, k=3, seed=2020))
+ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, color = as.factor(clusters))) +
+  geom_point() +
+  ggtitle("Clustering on all programmes, k=3")
+
+clusters <- factor(recode(clusters, "0" = "mid", "1" = "low", "2" = "high"), levels = c("low", "mid", "high"))
+p <- ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, color = clusters)) +
+  geom_point() +
+  ggtitle("All programmes") +
+  scale_colour_manual(values = c("low" = "#00AFBB", "mid" = "#E7B800", "high" = "#FC4E07")) +
+  theme_pubr()
+
+save_plot(p, filename = paste0(Sys.Date(), "_all_boxplots_phate.pdf"), base_height = 9, base_width = 12)
+```
+
+```{r Show differences between groups using boxplots}
+clusters_annot <- data.frame("Cluster" = clusters, "Patient_long" = rownames(cancer_phate$embedding))
+clusters_annot$Patient_short <- sapply(clusters_annot$Patient_long,
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+
+expr$Patient_long <- rownames(expr)
+
+clusters_annot <- merge(x = expr, y = clusters_annot, by = "Patient_long", all.y = T)
+clusters_annot$Cluster <- factor(clusters_annot$Cluster, levels = c("low", "mid", "high"))
+
+p1 <- ggboxplot(clusters_annot, x = "Cluster", y = "Dormancy",
+              color = "Cluster", palette =c("#00AFBB", "#E7B800", "#FC4E07"))
+p2 <- ggboxplot(clusters_annot, x = "Cluster", y = "Exhaustion",
+              color = "Cluster", palette =c("#00AFBB", "#E7B800", "#FC4E07"))
+p3 <- ggboxplot(clusters_annot, x = "Cluster", y = "mean_APOBEC",
+              color = "Cluster", palette =c("#00AFBB", "#E7B800", "#FC4E07"))
+
+my_comparisons <- combn(c("low", "mid", "high"), m = 2, simplify = F)
+p1 <- p1 + stat_compare_means(comparisons = my_comparisons, label = "p.signif") + # Add pairwise comparisons p-value
+  stat_compare_means(label.y = 15)
+
+p2 <- p2 + stat_compare_means(comparisons = my_comparisons, label = "p.signif") + # Add pairwise comparisons p-value
+  stat_compare_means(label.y = 13) 
+
+p3 <- p3 + stat_compare_means(comparisons = my_comparisons, label = "p.signif") + # Add pairwise comparisons p-value
+  stat_compare_means(label.y = 10) 
+
+save_plot(plot_grid(ggpar(p1, legend = "none"),
+                    ggpar(p2, legend = "none"),
+                    ggpar(p3, legend = "none"), align = "hv", nrow = 3), filename = paste0(Sys.Date(), "_programme_boxplots.pdf"), base_height = 9, base_width = 3)
+
+
+
+p <- ggboxplot(clusters_annot, x = "Cluster", y = "All",
+              color = "Cluster", palette =c("#00AFBB", "#E7B800", "#FC4E07"))
+p <- p + stat_compare_means(comparisons = my_comparisons, label = "p.signif") + # Add pairwise comparisons p-value
+  stat_compare_means(label.y = 12) 
+save_plot(ggpar(p, legend = "none"), filename = paste0(Sys.Date(), "_all_boxplots.pdf"), base_height = 3, base_width = 3)
+```
+
+```{r}
+fisher_all.progs <- merge(x = clusters_annot, y = maf_lenient, by = "Patient_short", all = FALSE)
+
+to_mid <- fisher.WL(data = fisher_all.progs,
+          genes = cosmic_list,
+          to_test = c("low", "high"),
+          to_compare = "mid")
+write.csv(to_mid, "all_to_mid.csv")
+
+lo_to_hi <- fisher.WL(data = fisher_all.progs,
+          genes = cosmic_list,
+          to_test = "low",
+          to_compare = "high")
+hi_to_lo <- fisher.WL(data = fisher_all.progs,
+          genes = cosmic_list,
+          to_test = "high",
+          to_compare = "low")
+to_extreme <- rbind(lo_to_hi, hi_to_lo)
+write.csv(lo_to_hi, "all_lo.csv")
+write.csv(hi_to_lo, "all_hi.csv")
+```
+
+```{r}
+fisher_all.progs_strict <- merge(x = clusters_annot, y = maf_strict, by = "Patient_short", all = FALSE)
+
+to_mid_strict <- fisher.WL(data = fisher_all.progs_strict,
+          genes = cosmic_list,
+          to_test = c("low", "high"),
+          to_compare = "mid")
+
+lo_to_hi_strict <- fisher.WL(data = fisher_all.progs_strict,
+          genes = cosmic_list,
+          to_test = "low",
+          to_compare = "high")
+hi_to_lo_strict <- fisher.WL(data = fisher_all.progs_strict,
+          genes = cosmic_list,
+          to_test = "high",
+          to_compare = "low")
+to_extreme_strict <- rbind(lo_to_hi, hi_to_lo)
+write.csv(hi_to_lo_strict, "all_hi_strict.csv")
+```
+
+###Every programme by itself
+```{r Dormancy}
+cancer_phate_dormancy <- phate(t(combat_cancer[dormancy_list, ]), seed = 2020)
+
+clusters <- as.vector(cluster_phate(cancer_phate_dormancy, k=3, seed=2020))
+ggplot(cancer_phate_dormancy, aes(x=PHATE1, y=PHATE2, color = as.factor(clusters))) +
+  geom_point() +
+  ggtitle("Clustering on dormancy, k=3")
+
+clusters <- factor(recode(clusters, "0" = "mid", "1" = "high", "2" = "low"), levels = c("low", "mid", "high"))
+p <- ggplot(cancer_phate_dormancy, aes(x=PHATE1, y=PHATE2, color = clusters)) +
+  geom_point() +
+  ggtitle("Clustering on dormancy, k=3") +
+  scale_colour_manual(values = c("low" = "#00AFBB", "mid" = "#E7B800", "high" = "#FC4E07")) +
+  theme_pubr()
+
+save_plot(p, filename = paste0(Sys.Date(), "_dormancy_boxplots_phate.pdf"), base_height = 9, base_width = 12)
+```
+
+
+```{r}
+clusters_annot <- data.frame("Cluster" = clusters, "Patient_long" = rownames(cancer_phate_dormancy$embedding))
+clusters_annot$Patient_short <- sapply(clusters_annot$Patient_long,
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+
+expr$Patient_long <- rownames(expr)
+
+clusters_annot <- merge(x = expr, y = clusters_annot, by = "Patient_long", all.y = T)
+clusters_annot$Cluster <- factor(clusters_annot$Cluster, levels = c("low", "mid", "high"))
+
+p1 <- ggboxplot(clusters_annot, x = "Cluster", y = "Dormancy",
+              color = "Cluster", palette =c("#00AFBB", "#E7B800", "#FC4E07"))
+
+my_comparisons <- combn(c("low", "mid", "high"), m = 2, simplify = F)
+p1 <- p1 + stat_compare_means(comparisons = my_comparisons, label = "p.signif") + # Add pairwise comparisons p-value
+  stat_compare_means(label.y = 15)
+
+save_plot(ggpar(p1, legend = "none"), filename = paste0(Sys.Date(), "_dormancy_boxplots.pdf"), base_height = 3, base_width = 3)
+```
+
+
+
+```{r}
+fisher_dormancy <- merge(x = clusters_annot, y = maf_lenient, by = "Patient_short", all = FALSE)
+
+to_mid <- fisher.WL(data = fisher_dormancy,
+          genes = cosmic_list,
+          to_test = c("low", "high"),
+          to_compare = "mid")
+write.csv(to_mid, "dormancy_to_mid.csv")
+
+lo_to_hi <- fisher.WL(data = fisher_dormancy,
+          genes = cosmic_list,
+          to_test = "low",
+          to_compare = "high")
+hi_to_lo <- fisher.WL(data = fisher_dormancy,
+          genes = cosmic_list,
+          to_test = "high",
+          to_compare = "low")
+to_extreme <- rbind(lo_to_hi, hi_to_lo)
+write.csv(lo_to_hi, "all_lo.csv")
+write.csv(hi_to_lo, "dormancy_hi.csv")
+```
+
+
+```{r}
+cancer_phate_exhaustion<- phate(t(combat_cancer[exhaustion_list, ]), seed = 2020)
+
+clusters <- as.vector(cluster_phate(cancer_phate_exhaustion, k=3, seed=2020))
+ggplot(cancer_phate_dormancy, aes(x=PHATE1, y=PHATE2, color = as.factor(clusters))) +
+  geom_point() +
+  ggtitle("Clustering on exhaustion, k=3")
+
+clusters <- factor(recode(clusters, "0" = "mid", "1" = "high", "2" = "low"), levels = c("low", "mid", "high"))
+p <- ggplot(cancer_phate_dormancy, aes(x=PHATE1, y=PHATE2, color = clusters)) +
+  geom_point() +
+  ggtitle("Clustering on exhaustion, k=3") +
+  scale_colour_manual(values = c("low" = "#00AFBB", "mid" = "#E7B800", "high" = "#FC4E07")) +
+  theme_pubr()
+
+save_plot(p, filename = paste0(Sys.Date(), "_exhaustion_boxplots_phate.pdf"), base_height = 9, base_width = 12)
+```
+
+
+```{r}
+clusters_annot <- data.frame("Cluster" = clusters, "Patient_long" = rownames(cancer_phate_exhaustion$embedding))
+clusters_annot$Patient_short <- sapply(clusters_annot$Patient_long,
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+
+expr$Patient_long <- rownames(expr)
+
+clusters_annot <- merge(x = expr, y = clusters_annot, by = "Patient_long", all.y = T)
+clusters_annot$Cluster <- factor(clusters_annot$Cluster, levels = c("low", "mid", "high"))
+
+p1 <- ggboxplot(clusters_annot, x = "Cluster", y = "Exhaustion",
+              color = "Cluster", palette =c("#00AFBB", "#E7B800", "#FC4E07"))
+
+my_comparisons <- combn(c("low", "mid", "high"), m = 2, simplify = F)
+p1 <- p1 + stat_compare_means(comparisons = my_comparisons, label = "p.signif") + # Add pairwise comparisons p-value
+  stat_compare_means(label.y = 15)
+
+save_plot(ggpar(p1, legend = "none"), filename = paste0(Sys.Date(), "_exhaustion_boxplots.pdf"), base_height = 3, base_width = 3)
+```
+
+```{r}
+fisher_exhaustion <- merge(x = clusters_annot, y = maf_lenient, by = "Patient_short", all = FALSE)
+
+to_mid <- fisher.WL(data = fisher_exhaustion,
+          genes = cosmic_list,
+          to_test = c("low", "high"),
+          to_compare = "mid")
+write.csv(to_mid, "exhaustion_to_mid.csv")
+
+lo_to_hi <- fisher.WL(data = fisher_dormancy,
+          genes = cosmic_list,
+          to_test = "low",
+          to_compare = "high")
+hi_to_lo <- fisher.WL(data = fisher_exhaustion,
+          genes = cosmic_list,
+          to_test = "high",
+          to_compare = "low")
+to_extreme <- rbind(lo_to_hi, hi_to_lo)
+write.csv(lo_to_hi, "all_lo.csv")
+write.csv(hi_to_lo, "exhaustion_hi.csv")
+```
+
+
+
+
+
+```{r}
+cancer_phate_APOBEC<- phate(t(combat_cancer[apobec_list, ]), seed = 2020)
+
+clusters <- as.vector(cluster_phate(cancer_phate_APOBEC, k=3, seed=2020))
+ggplot(cancer_phate_APOBEC, aes(x=PHATE1, y=PHATE2, color = as.factor(clusters))) +
+  geom_point() +
+  ggtitle("Clustering on APOBEC, k=3")
+
+clusters <- factor(recode(clusters, "0" = "low", "1" = "mid", "2" = "high"), levels = c("low", "mid", "high"))
+p <- ggplot(cancer_phate_APOBEC, aes(x=PHATE1, y=PHATE2, color = clusters)) +
+  geom_point() +
+  ggtitle("Clustering on APOBEC, k=3") +
+  scale_colour_manual(values = c("low" = "#00AFBB", "mid" = "#E7B800", "high" = "#FC4E07")) +
+  theme_pubr()
+
+save_plot(p, filename = paste0(Sys.Date(), "_APOBEC_boxplots_phate.pdf"), base_height = 9, base_width = 12)
+```
+
+
+```{r}
+clusters_annot <- data.frame("Cluster" = clusters, "Patient_long" = rownames(cancer_phate_APOBEC$embedding))
+clusters_annot$Patient_short <- sapply(clusters_annot$Patient_long,
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+
+expr$Patient_long <- rownames(expr)
+
+clusters_annot <- merge(x = expr, y = clusters_annot, by = "Patient_long", all.y = T)
+clusters_annot$Cluster <- factor(clusters_annot$Cluster, levels = c("low", "mid", "high"))
+
+p1 <- ggboxplot(clusters_annot, x = "Cluster", y = "mean_APOBEC",
+              color = "Cluster", palette =c("#00AFBB", "#E7B800", "#FC4E07"))
+
+my_comparisons <- combn(c("low", "mid", "high"), m = 2, simplify = F)
+p1 <- p1 + stat_compare_means(comparisons = my_comparisons, label = "p.signif") + # Add pairwise comparisons p-value
+  stat_compare_means(label.y = 10.5)
+
+save_plot(ggpar(p1, legend = "none"), filename = paste0(Sys.Date(), "_APOBEC_boxplots.pdf"), base_height = 3, base_width = 3)
+```
+
+
+
+
+
+
+
+## Scatter plots to show inter-programme correlations on patient level
+```{r}
+p1 <- ggscatter(expr, x = "mean_APOBEC", y = "Exhaustion",
+   color = "lightgrey", shape = 16, size = 0.6, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#FC4E07", fill = "#E7B800", size = 0.8), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "pearson", label.x = 3, label.sep = "\n")
+   )
+p2 <- ggscatter(expr, x = "mean_APOBEC", y = "Dormancy",
+   color = "lightgrey", shape = 16, size = 0.6, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#FC4E07", fill = "#E7B800", size = 0.8), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "pearson", label.x = 3, label.sep = "\n")
+   )
+p3 <- ggscatter(expr, x = "Dormancy", y = "Exhaustion",
+   color = "lightgrey", shape = 16, size = 0.6, # Points color, shape and size
+   add = "reg.line",  # Add regressin line
+   add.params = list(color = "#FC4E07", fill = "#E7B800", size = 0.8), # Customize reg. line
+   conf.int = TRUE, # Add confidence interval
+   cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+   cor.coeff.args = list(method = "pearson", label.x = 6, label.sep = "\n")
+   )
+
+
+save_plot(p1, filename = paste0(Sys.Date(), "_corr_APOBEC_exhaustion.pdf"), base_height = 3, base_width = 4)
+save_plot(p2, filename = paste0(Sys.Date(), "_corr_APOBEC_dormancy.pdf"), base_height = 3, base_width = 4)
+save_plot(p3, filename = paste0(Sys.Date(), "_corr_dormancy_exhaustion.pdf"), base_height = 3, base_width = 4)
+```
+
+
+
+
+
+
+
+
