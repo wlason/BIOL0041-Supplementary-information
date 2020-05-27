@@ -1,0 +1,2288 @@
+---
+title: "BIOL0041 extended research project - lab report"
+output: html_notebook
+---
+
+## Install and load packages
+```{r}
+install.packages("phateR")
+install.packages("umap")
+
+library(BiocManager)
+install("maftools")
+install("TCGAbiolinks")
+install("ConsensusClusterPlus")
+install("M3C")
+install("sva")
+
+library(devtools)
+install_github("vqv/ggbiplot")
+```
+
+
+```{r}
+library(cowplot)
+library(ggplot2)
+library(ggpubr)
+library(gtools)
+#library(TCGAbiolinks) #very big, load only if needed
+library(plyr)
+library(dplyr)
+library(stringr)
+library(pheatmap)
+library(reshape2)
+library(ConsensusClusterPlus)
+library(RColorBrewer)
+library(scales)
+library(phateR)
+library(ConsensusTME)
+
+solid_tumours <- c("blca", "brca", "cesc", "chol", "coad", "esca",  "hnsc", "kich", "kirc", "kirp", "lihc", "luad", "lusc", "prad", "stad", "thca", "ucec")
+```
+## Download and curate dormancy, exhaustion, and APOBEC programmes
+
+### Dormancy, exhaustion, and APOBEC programme definitions
+```{r Specify genes of interest}
+dormancy_list <- c("CD80", "CD274", "CXCL9", "CXCL10", "IRF7", "INFB1", "IFNAR1", "IFNAR2", "IFNG", "TNF", "STAT1", "TNFRSF1A", "PLAUR", "PTK2", "ITGA5", "ITGB1", "KDR", "VEGFA", "MMP9", "ZEB1")
+
+exhaustion_list <- c("CD244", "BATF", "PRDM1", "CD160", "ENTPD1", "ITGAE", "EOMES", "TBX21", "IFNG", "IL10", "IL12A", "EBI3", "STAT1", "STAT3", "STAT4", "IRF4", "LAG3", "NFATC1", "NFATC2", "NFATC4", "PDCD1", "CTLA4", "PROCR", "PDPN", "MAF", "PTPN11", "SPRY1", "SPRY2", "TIGIT", "CD226", "HAVCR2", "TRAF1")
+
+apobec_list <- c("AICDA", "APOBEC1", "APOBEC2", "APOBEC3A", "APOBEC3B", "APOBEC3C", "APOBEC3D", "APOBEC3F", "APOBEC3G", "APOBEC3H", "APOBEC4")
+
+COSMIC <- read.csv("~/GitHub/BIOL0041 Immune dormancy/COSMIC.csv")
+cosmic_list <- as.character(COSMIC$Gene.Symbol)
+rm(COSMIC)
+```
+
+### Remove genes with missing expression data
+I used BRCA as a representative example for all the cancers.
+```{r Investigating missing genes in the data}
+#Loding in controls
+#Tumour: has '_t'
+brca <- read.delim("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/brca-rsem-fpkm-tcga.txt.gz")
+
+setdiff(dormancy_list, intersect(dormancy_list, brca$Hugo_Symbol))
+      # "INFB1" missing
+dormancy_list <- intersect(dormancy_list, brca$Hugo_Symbol)
+
+setdiff(exhaustion_list, intersect(exhaustion_list, brca$Hugo_Symbol))
+      # none missing
+
+setdiff(apobec_list, intersect(apobec_list, brca$Hugo_Symbol))
+      #none missing
+
+setdiff(cosmic_list, intersect(cosmic_list, brca$Hugo_Symbol))
+      #"AFDN", "IGH", "IGK", "IGL", "KNL1", "MRTFA", "NSD2", "NSD3", "TENT5C", "TRA", "TRB", "TRD", "WDCP"
+cosmic_list <- intersect(cosmic_list, brca$Hugo_Symbol)
+
+#Vector of all the studied programmes (for convenience)
+all_genes_list <- unique(c(dormancy_list, exhaustion_list, apobec_list))
+
+rm(brca)
+```
+
+### Download MAF data
+```{r Download MAF fata (mutations and predicted results)}
+solid_tumours <- str_to_upper(solid_tumours)    #The cancers in TCGAbiolinks need to be in capitals
+genes_to_save <- unique(c(all_genes_list, cosmic_list)) #Downloading genes from programmes and from COSMIC
+
+for (tumour in solid_tumours){
+  print(paste0(tumour, ": This is ", which(tumour == solid_tumours), " out of ", length(solid_tumours)))    #Show progress
+  df.maf <- GDCquery_Maf(tumour, pipelines = "muse")
+  df.maf.short <- df.maf[,c("Tumor_Sample_Barcode",
+                          "Hugo_Symbol","Chromosome",
+                          "Start_Position","End_Position",
+                          "Variant_Classification",
+                          "Variant_Type",
+                          "Reference_Allele",
+                          "Tumor_Seq_Allele1",
+                          "Tumor_Seq_Allele2",
+                          "One_Consequence",
+                          "Consequence",
+                          "SIFT","PolyPhen")]
+  df.maf.short$Cancer <- as.character(tumour)
+  df.maf.short <- subset(df.maf.short, Hugo_Symbol %in% genes_to_save)
+
+  if (tumour == solid_tumours[1]){
+    maf_all <- df.maf.short
+  } else {
+    maf_all <- rbind(maf_all, df.maf.short)
+  }
+}
+#save(maf_all, file = "maf_all.RData")
+
+maf_all$Patient_short <- sapply(maf_all$Tumor_Sample_Barcode,
+                             function(x) paste(str_split(x, "-", simplify = T)[1:4], collapse = "-"))
+
+
+maf_all.strict <- maf_all[ which((maf_all$Variant_Classification
+                                       %in% c("Missense_Mutation",
+                                              "Nonsense_Mutation",
+                                              "Nonstop_Mutation",
+                                              "Frameshift_Deletion",
+                                              "Frameshift_Insertion",
+                                              "Inframe_Insertion",
+                                              "Inframe_Deletion")) &
+                                  (grepl("deleterious",maf_all$SIFT)|
+                                     grepl("damaging",maf_all$PolyPhen))),
+                                       ]
+
+
+maf_all.lenient <- maf_all[ which(maf_all$Variant_Classification
+                                      %in% c("Missense_Mutation",
+                                             "Nonsense_Mutation",
+                                             "Nonstop_Mutation",
+                                             "Frameshift_Deletion",
+                                             "Frameshift_Insertion",
+                                             "Inframe_Insertion",
+                                             "Inframe_Deletion")),
+                                        ]
+rm(maf_all)
+
+maf_all.strict$Mutation <- 1      #Gives every patient-gene mutation value 1
+maf_all.strict <- dcast(maf_all.strict, value.var = "Mutation",
+                        formula = Tumor_Sample_Barcode+Patient_short+Cancer~Hugo_Symbol,
+                        fun.aggregate = function(x) ifelse(sum(x)>0, yes = 1, no = 0))
+                        #Because aggregation function sums all the values, we give 1 if sum>0,
+                        #and 0 if there are no mutations
+
+maf_all.lenient$Mutation <- 1
+maf_all.lenient <- dcast(maf_all.lenient, value.var = "Mutation",
+                        formula = Tumor_Sample_Barcode+Patient_short+Cancer~Hugo_Symbol,
+                        fun.aggregate = function(x) ifelse(sum(x)>0, yes = 1, no = 0))
+```
+
+### Download RNAseq data
+```{r Download RNAseq data for programmes}
+solid_tumours <- str_to_lower(solid_tumours)
+
+for (tumour in solid_tumours){
+  #Indicate progress
+  print(paste0(tumour, ": This is ", match(tumour, solid_tumours), " out of ", length(solid_tumours)))
+  
+  file_cancer <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga-t.txt.gz")
+  file_ctrl <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga.txt.gz")
+  
+  cancer <- read.delim(file_cancer)
+  ctrl <- read.delim(file_ctrl)
+  
+  rownames(cancer) <- cancer$Hugo_Symbol
+  cancer <- cancer[all_genes_list, c(-1, -2)]
+  
+  rownames(ctrl) <- ctrl$Hugo_Symbol
+  ctrl <- ctrl[all_genes_list, c(-1, -2)]
+  
+  cancer_type <- data.frame("Patient_long" = c(colnames(cancer), colnames(ctrl)))
+  cancer_type$Cancer <- as.character(tumour)
+  
+  if (tumour == solid_tumours[1]){
+    rnaseq_cancer <- cancer
+    rnaseq_ctrl <- ctrl
+    cancer_types <- cancer_type
+  } else {
+    rnaseq_cancer <- cbind(rnaseq_cancer, cancer)
+    rnaseq_ctrl <- cbind(rnaseq_ctrl, ctrl)
+    cancer_types <- rbind(cancer_types, cancer_type)
+  }
+}
+rm(tumour, file_cancer, file_ctrl, cancer, ctrl, cancer_type)
+
+#Remove outlier:
+rnaseq_cancer <- rnaseq_cancer[, -c(grep("TCGA.38.4625.", x = colnames(rnaseq_cancer)))]
+rnaseq_ctrl <- rnaseq_ctrl[, -c(grep("TCGA.38.4625.", x = colnames(rnaseq_ctrl)))]
+
+
+rnaseq_cancer <- log2(rnaseq_cancer+1)
+rnaseq_ctrl <- log2(rnaseq_ctrl+1)
+```
+
+
+```{r Download all RNAseq data}
+solid_tumours <- str_to_lower(solid_tumours)
+
+for (tumour in solid_tumours){
+  #Indicate progress
+  print(paste0(tumour, ": This is ", match(tumour, solid_tumours), " out of ", length(solid_tumours)))
+  
+  file_cancer <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga-t.txt.gz")
+
+  cancer <- read.delim(file_cancer)
+  
+  rownames(cancer) <- cancer$Hugo_Symbol
+  cancer$Entrez_Gene_Id <- NULL
+  
+  if (tumour == solid_tumours[1]){
+    rnaseq_cancer_all <- cancer
+  } else {
+    rnaseq_cancer_all <- merge(rnaseq_cancer_all, cancer, by = "Hugo_Symbol")
+  }
+}
+rm(tumour, file_cancer, cancer)
+
+rownames(rnaseq_cancer_all) <- rnaseq_cancer_all$Hugo_Symbol
+rnaseq_cancer_all$Hugo_Symbol <- NULL
+
+#Remove outlier:
+rnaseq_cancer_all <- rnaseq_cancer_all[, -c(grep("TCGA.38.4625.", x = colnames(rnaseq_cancer_all)))]
+
+rnaseq_cancer_all <- log2(rnaseq_cancer_all+1)
+```
+
+
+```{r Download GTEx data}
+gtex_controls <- c("bladder", "breast", "cervix", "colon", "esophagus_muc", "kidney", "liver", "lung", "prostate", "stomach", "thyroid", "uterus")
+
+for (gtex in gtex_controls){
+  #Indicate progress
+  print(paste0(gtex, ": This is ", match(gtex, gtex_controls), " out of ", length(gtex_controls)))
+  
+  path <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/GTEx/", gtex, "-rsem-fpkm-gtex.txt.gz")
+  file <- read.delim(path)
+  
+  rownames(file) <- file$Hugo_Symbol
+  file <- file[all_genes_list, c(-1, -2)]
+  
+  if (gtex == gtex_controls[1]){
+    gtex_tissues <- file
+  } else {
+    gtex_tissues <- cbind(gtex_tissues, file)
+  }
+}
+rm(gtex, file, path)
+
+#Normalize values
+gtex_tissues <- log2(gtex_tissues+1)
+```
+
+
+```{r Summary graph of the mutations in cancer patients}
+assign.programme <- function(gene){
+  all <- c(apobec_list, exhaustion_list, dormancy_list)
+  many <- all[duplicated(all)]
+  if (gene %in% many) {
+    as.factor("Dormancy + \n Exhaustion")
+  } else if (gene %in% apobec_list) {
+    as.factor("APOBEC")
+  } else if (gene %in% exhaustion_list) {
+    as.factor("Exhaustion")
+  } else if (gene %in% dormancy_list) {
+    as.factor("Dormancy")
+  } else if (gene %in% cosmic_list) {
+    as.factor("COSMIC")
+  } else {
+    as.factor("None")
+  }
+}
+
+mafs <- list("Lenient" = maf_all.lenient, "Strict" = maf_all.strict)
+
+for(i in 1:2){
+maf <- mafs[[i]]
+name <- names(mafs)[i]
+  
+maf_summary <- maf[, -c(1,2)] %>% group_by(Cancer) %>% summarise_all(funs(sum))
+maf_summary_pan <- sort(colSums(maf_summary[, -1]), decreasing = T)
+
+maf_summary_gg <- melt(maf_summary, variable.name = "Gene", value.name = "Mutations")
+maf_summary_gg$Programme <- sapply(maf_summary_gg$Gene, function(x) assign.programme(x))
+maf_summary_gg$Cancer <- as.factor(maf_summary_gg$Cancer)
+maf_summary_gg$Gene <- as.factor(maf_summary_gg$Gene)
+
+p1 <- ggplot(subset(maf_summary_gg, Gene %in% all_genes_list), 
+       aes(x = reorder(Gene, -Mutations), y = Mutations, group = Cancer, fill = Cancer)) +
+  geom_bar(stat = "identity", position = "stack") +
+  ylab("Number of patients with mutations") +
+  xlab("Gene name") +
+  ggtitle(label = "Programmes breakdown by cancer type", subtitle = paste0(name, " criteria")) +
+  theme_pubr() +
+  theme(legend.position = "top", legend.title = element_text(face = "bold", angle = 90)) +
+  labs(fill = "TCGA cancer") +
+  guides(fill = guide_legend(title.position = "left")) +
+  theme(text = element_text(family = "Helvetica")) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 6))
+
+p2 <- ggplot(subset(maf_summary_gg, Gene %in% c(all_genes_list, names(maf_summary_pan)[1:10])), 
+       aes(x = reorder(Gene, -Mutations), y = Mutations, group = Cancer, fill = Programme)) +
+  geom_bar(stat = "identity") +
+  ylab("Number of patients with mutations") +
+  xlab("Gene name") +
+  ggtitle(label = "Comparison with top 10 COSMIC tier 1 genes") +
+  theme_pubr() +
+  theme(legend.position = "right", legend.title = element_text(face = "bold", angle = 90)) +
+  labs(fill = "Programme") +
+  guides(fill = guide_legend(title.position = "left")) +
+  theme(text = element_text(family = "Helvetica")) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 6))
+
+save_plot(p1, filename = paste0("maf_summary", name, "_1.svg"), base_width = 8)
+p1 <- p1 + theme(legend.position = "none")
+save_plot(p1, filename = paste0("maf_summary", name, "_1_nolegend.svg"), base_width = 8)
+
+save_plot(p2, filename = paste0("maf_summary", name, "_2.svg"), base_width = 8)
+p2 <- p2 + theme(legend.position = "none")
+save_plot(p2, filename = paste0("maf_summary", name, "_2_nolegend.svg"), base_width = 8)
+}
+
+rm(mafs, maf, maf_summary, maf_summary_gg, i, p1, p2)
+```
+
+```{r Calculate mean numbers}
+sum(maf_summary_gg[maf_summary_gg$Programme=="COSMIC", "Mutations"])/10
+
+sum(maf_summary_gg[maf_summary_gg$Programme %in% c("Dormancy + \n Exhaustion", "APOBEC", "Exhaustion", "Dormancy"), "Mutations"])/60
+
+
+t.test(maf_summary_gg[maf_summary_gg$Programme=="COSMIC", "Mutations"], maf_summary_gg[maf_summary_gg$Programme %in% c("Dormancy + \n Exhaustion", "APOBEC", "Exhaustion", "Dormancy"), "Mutations"])
+```
+
+
+##Section 2: Clustering and heatmaps
+### Make heatmaps
+```{r Create annotation file}
+rnaseq_annot <- data.frame("Patient_long" = c(colnames(rnaseq_cancer), 
+                                              colnames(rnaseq_ctrl)),
+                            "Sample_type" = c(rep("Cancer", ncol(rnaseq_cancer)), 
+                                              rep("Control", ncol(rnaseq_ctrl))))
+rnaseq_annot$Patient_short <- sapply(rnaseq_annot$Patient_long,
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+#Remove duplicates
+rnaseq_annot <- rnaseq_annot[!duplicated(rnaseq_annot$Patient_short), ]
+rnaseq_annot <- merge(x = rnaseq_annot, y = cancer_types, by = "Patient_long", all.x = T)
+rnaseq_annot <- merge(x = rnaseq_annot, y = maf_all.lenient[ ,colnames(maf_all.lenient) != "Cancer"], by = "Patient_short", all.x = T)
+
+#NAs mean that patient not found in the MAF, so no mutations in the gene. Replacing NAs with 0s
+rnaseq_annot[, -c(1:5)] <- apply(rnaseq_annot[, -c(1:5)], MARGIN = 2, FUN = function(x) str_replace_na(x, replacement = 0))
+#Change 0 and 1 to facotrs
+rnaseq_annot[, -c(1:5)] <- apply(rnaseq_annot[, -c(1:5)], MARGIN = 2, FUN = function(x) as.factor(x))
+
+rownames(rnaseq_annot) <- rnaseq_annot$Patient_long
+
+gtex_annot <- data.frame("Patient_long" = colnames(gtex_tissues),
+                         "Sample_type" = rep("GTEx", ncol(gtex_tissues)))
+gtex_annot <- rbind(rnaseq_annot[, c("Patient_long", "Sample_type")], gtex_annot)
+rownames(gtex_annot) <- gtex_annot$Patient_long
+
+gene_annot <- data.frame(row.names = all_genes_list)
+gene_annot$Programme <- sapply(rownames(gene_annot), function(x) assign.programme(x))
+
+hmap_genes_cancer <- rnaseq_cancer[all_genes_list, ]
+hmap_genes_cancer <- hmap_genes_cancer[, colnames(hmap_genes_cancer) %in% rnaseq_annot$Patient_long]
+
+hmap_genes_control <- rnaseq_ctrl[all_genes_list, ]
+hmap_genes_control <- hmap_genes_control[, colnames(hmap_genes_control) %in% rnaseq_annot$Patient_long]
+
+hmap_genes_gtex <- gtex_tissues[all_genes_list, ]
+hmap_genes_gtex <- cbind(hmap_genes_cancer, hmap_genes_control, hmap_genes_gtex)
+
+hmap_genes_both <- cbind(hmap_genes_cancer, hmap_genes_control)
+
+top_drivers <- names(maf_summary_pan)[1:6]
+
+mut_colours <- list()
+for(i in 1:6){
+mut_colours[[i]] <- c("0" = "thistle1", "1" = "mediumorchid")  
+}
+names(mut_colours) <- top_drivers
+
+prog_colours <- brewer.pal(4, "Set2")
+names(prog_colours) <- c("APOBEC", "Dormancy", "Exhaustion", "Dormancy + \n Exhaustion")
+prog_colours <- list(Programme = prog_colours)
+
+clust_colours <- dscale(factor(1:3), hue_pal(l = 75))
+names(clust_colours) <- as.character(1:3)
+clust_colours <- list(Cluster_ID = clust_colours)
+```
+
+
+```{r Creating heatmaps}
+hclust_cancer <- pheatmap(hmap_genes_cancer, 
+         show_colnames = FALSE, 
+         filename = paste0(Sys.Date(), "_hclust_cancer.pdf"), 
+         annotation_col = rnaseq_annot[, top_drivers],
+         annotation_row = gene_annot,
+         annotation_names_row = F,
+         treeheight_col = 100, 
+         treeheight_row = 0,
+         cutree_cols = 3,
+         fontsize_row = 6,
+         annotation_colors = c(mut_colours, prog_colours))
+
+pheatmap(hmap_genes_control, 
+         show_colnames = FALSE, 
+         filename = paste0(Sys.Date(), "_hclust_control.pdf"), 
+         annotation_col = rnaseq_annot[, top_drivers], 
+         annotation_row = gene_annot,
+         annotation_names_row = F,
+         treeheight_col = 100, 
+         treeheight_row = 0,
+         cutree_cols = NA,
+         fontsize_row = 6,
+         annotation_colors = mut_colours)
+
+pheatmap(hmap_genes_both, 
+         show_colnames = FALSE, 
+         filename = paste0(Sys.Date(), "_hclust_cancer_control.pdf"), 
+         annotation_col = rnaseq_annot[, c(top_drivers, "Sample_type")],
+         annotation_row = gene_annot,
+         annotation_names_row = F,
+         treeheight_col = 100,
+         treeheight_row = 0,
+         cutree_cols = 2,
+         fontsize_row = 4,
+         annotation_colors = c(list(Sample_type = c(Cancer = "firebrick1", Control = "deepskyblue")),
+                               mut_colours))
+
+pheatmap(hmap_genes_gtex, 
+         show_colnames = FALSE, 
+         filename = paste0(Sys.Date(), "_hclust_cancer_control_gtex.pdf"), 
+         annotation_col = data.frame("Sample_type" = gtex_annot$Sample_type, row.names = gtex_annot$Patient_long),
+         annotation_row = gene_annot,
+         annotation_names_row = F,
+         treeheight_col = 100,
+         treeheight_row = 0,
+         cutree_cols = 2,
+         fontsize_row = 4,
+         annotation_colors = c(list(Sample_type = c(Cancer = "firebrick1", Control = "deepskyblue", GTEx = "deepskyblue4")),
+                               prog_colours))
+```
+
+
+### Perform Fisher's exact test
+```{r Perform Fisher exact test on clusters}
+clusters <- as.data.frame(cutree(hclust_cancer$tree_col, k = 3))
+colnames(clusters) <- "Cluster_ID"
+rnaseq_annot_cancer <- merge(x = rnaseq_annot, y = clusters, by = "row.names")
+rownames(rnaseq_annot_cancer) <- rnaseq_annot_cancer$Row.names
+rnaseq_annot_cancer$Row.names <- NULL
+rnaseq_annot_cancer$Cluster_ID <- as.factor(rnaseq_annot_cancer$Cluster_ID)
+
+pheatmap(hmap_genes_cancer, 
+         show_colnames = FALSE, 
+         filename = paste0(Sys.Date(), "_hclust_cancer_with_clusters.pdf"), 
+         annotation_col = rnaseq_annot_cancer[, c(top_drivers, "Cluster_ID")],
+         annotation_row = gene_annot,
+         annotation_names_row = F,
+         treeheight_col = 100, 
+         treeheight_row = 0,
+         cutree_cols = 3,
+         fontsize_row = 6,
+         annotation_colors = c(mut_colours, prog_colours, clust_colours))
+
+
+for (cluster in unique(clusters$Cluster_ID)){
+  
+      for (gene in cosmic_list){
+      fisher_data <- rnaseq_annot_cancer[which(rnaseq_annot_cancer$Sample_type ==  "Cancer"), c(gene, "Cluster_ID")]
+      
+      fisher_matrix <- matrix(c(length(which(fisher_data[, gene] == 1 & fisher_data[, "Cluster_ID"] == cluster)),
+                                length(which(fisher_data[, gene] == 0 & fisher_data[, "Cluster_ID"] == cluster)),
+                                length(which(fisher_data[, gene] == 1 & fisher_data[, "Cluster_ID"] != cluster)),
+                                length(which(fisher_data[, gene] == 0 & fisher_data[, "Cluster_ID"] != cluster))), nrow = 2, byrow = TRUE)
+      rownames(fisher_matrix) <- c("c_interest", "rest")
+      colnames(fisher_matrix) <- c("MU", "WT")
+      
+      f <- fisher.test(fisher_matrix)
+      
+      if (gene == cosmic_list[1] && cluster == clusters[1]){
+      l <- length(unique(clusters$Cluster_ID))
+      results <- vector(mode = "list", length = l)
+      for (i in 1:l){
+        results[[i]] <- data.frame()
+      }
+      }
+      
+      results[[cluster]][gene, "p_val"] <- f$p.value
+      results[[cluster]][gene, "odds"] <- f$estimate
+      results[[cluster]][gene, "WT_cluster"] <- fisher_matrix["c_interest", "WT"]
+      results[[cluster]][gene, "MU_cluster"] <- fisher_matrix["c_interest", "MU"]
+      results[[cluster]][gene, "WT_rest"] <- fisher_matrix["rest", "WT"]
+      results[[cluster]][gene, "MU_rest"] <- fisher_matrix["rest", "MU"]
+      results[[cluster]][gene, "gene"] <- gene
+      results[[cluster]][gene, "cluster"] <- cluster
+      }
+}
+#Remove spuious associations: multiple testing corrections
+# p.adjust(vector.of.associations, method=BH)
+#Default: boniferroni correction
+results <- bind_rows(results)
+results$p_adj <- p.adjust(results$p_val, method = "BH")
+results <- subset(results, p_adj<0.05)
+results$p_adj_star <- stars.pval(results$p_adj)
+write.csv(results, file = paste0(Sys.Date(), "_Fisher_test_hclust.csv"))
+```
+
+```{r Density plots of COSMIC oncogenes in each cluster identified - DELETE????}
+for (k in 4:6){
+clusters <- as.data.frame(clust_robust[[k]]$consensusClass)
+colnames(clusters) <- "Cluster_ID"
+
+fisher_results <- read.csv(paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/results_", k, ".csv"))
+
+for (tumour in solid_tumours){
+  #Indicate progress
+  print(paste0(tumour, ": This is ", match(tumour, solid_tumours), " out of ", length(solid_tumours)))
+  
+  file_cancer <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga-t.txt.gz")
+  cancer <- read.delim(file_cancer)
+  
+  rownames(cancer) <- cancer$Hugo_Symbol
+  cancer <- cancer[as.vector(fisher_results$gene), c(-1, -2)]
+  
+  if (tumour == solid_tumours[1]){
+    rnaseq_gg <- cancer
+  } else {
+    rnaseq_gg <- cbind(rnaseq_gg, cancer)
+  }
+}
+
+#Remove outlier:
+rnaseq_gg <- rnaseq_gg[, -c(grep("TCGA.38.4625.", x = colnames(rnaseq_gg)))]
+#Scale
+rnaseq_gg <- log2(rnaseq_gg+1)
+expr_gg <- as.data.frame(t(rnaseq_gg))
+expr_gg <- merge(expr_gg, clusters, by = "row.names")
+expr_gg$Row.names <- NULL
+expr_gg <- melt(expr_gg, id.vars = "Cluster_ID", variable.name = "Gene", value.name = "Expr")
+expr_gg$Cluster_ID <- as.factor(expr_gg$Cluster_ID)
+labs <- paste(fisher_results$gene, paste0("p = ", formatC(fisher_results$p_adj, format = "e", digits = 2)), sep = "\n")
+names(labs) <- fisher_results$gene
+p1 <- ggplot(expr_gg, aes(x = Expr, group = Cluster_ID, fill = Cluster_ID)) +
+  geom_density(alpha=0.8) +
+  facet_wrap(~Gene, scales = "free", labeller = labeller(Gene = labs)) +
+  theme(strip.text = element_text(size = 14), text = element_text(size = 14), legend.text = element_text(size = 14), legend.title = element_text(size = 16)) +
+  xlab("Expression") +
+  ylab("Density") +
+  scale_fill_hue(l = 75)
+
+p2 <- ggplot(expr_gg, aes(y = Expr, x = Cluster_ID)) +
+  geom_jitter(aes(colour = Cluster_ID)) +
+  geom_boxplot(fill = "transparent", lwd = 1.2) +
+  facet_wrap(~Gene, scales = "free", labeller = labeller(Gene = labs)) +
+  theme(strip.text = element_text(size = 14), text = element_text(size = 14), legend.text = element_text(size = 14), legend.title = element_text(size = 16)) +
+  ylab("Expression") +
+  xlab("Cluster ID") +
+  scale_fill_hue(l = 75)
+
+save_plot(plot_grid(p1, p2, align = "hv", nrow = 2), 
+          filename = paste0("/Users/wojciechlason/Documents/MSci Project/Graphs/density_plots_k", k, ".pdf"), base_height = 12)
+}
+```
+
+### Introducing variance parameter in an effort to improve clustering
+
+This approach did not work, but included in lab report.
+```{r Calculate variance}
+top_genes <- sapply(as.data.frame(t(hmap_genes_cancer)), function(x) var(x, na.rm = TRUE))
+
+top_genes_plot <- as.data.frame(top_genes)
+colnames(top_genes_plot) <- "Variance"
+top_genes_plot$Gene <- rownames(top_genes_plot)
+top_genes_plot <- arrange(top_genes_plot, desc(Variance))
+top_genes_plot$Top <- c(rep("y", 5), rep("n", nrow(top_genes_plot) - 5))
+```
+
+```{r Make heatmaps}
+p <- ggplot(top_genes_plot, aes(x = reorder(Gene, -Variance), y = Variance, fill = Top)) +
+  geom_bar(stat = "identity") +
+  theme_pubr() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 9),
+        legend.position = "none") +
+  scale_fill_manual("legend", values = c("#999999", "#E69F00")) +
+  labs(title = "Calculated variance of expression values", x = "Gene", y = "Variance")
+
+save_plot(p, filename = "calculated_variance.svg", base_width = 8)
+
+for (n in seq(from = 5, to = 30, 5)){
+top <- sort(top_genes, decreasing = TRUE)[1:n]
+
+p <- pheatmap(hmap_genes_cancer[rownames(hmap_genes_cancer) %in% names(top), ], 
+         show_colnames = FALSE, 
+         filename = paste0("/Users/wojciechlason/Documents/MSci Project/Graphs/top", n, "_genes_cancer.pdf"), 
+         annotation_col = rnaseq_annot_2[, c("BRAF", "KRAS", "NF1", "APC", "Cluster_ID")], 
+         treeheight_col = 100, 
+         cutree_cols = 3,
+         annotation_colors = c(list(Sample_type = c(Cancer = "firebrick1", Control = "deepskyblue")), mut_colours))
+                    
+#Save the heatmap with best clustering
+          if (n == 5){
+            hmap_cancer_top <- p
+          }
+}
+```
+
+## Section 3: Finding the optimal clustering of pancancer samples
+
+### Attempt using ConsensusClusterPlus
+WARNING: Do not attempt to run this on a personal computer, takes a long time and computationally intense.
+```{r Run CCPlus, eval=FALSE}
+clust_robust <- ConsensusClusterPlus(as.matrix(hmap_genes_cancer),
+                                     maxK=10,
+                                     reps=1000,
+                                     pItem=0.80,
+                                     pFeature=1.00,
+                                     title="Pancancer robust 1000", plot="png",
+                                     clusterAlg="hc",
+                                     distance="euclidean",
+                                     finalLinkage="complete", innerLinkage="complete",
+                                     seed=2019,
+                                     verbose = TRUE)
+#Takes approx. an hour to do 100 reps
+#save(clust_robust, file = "clust_robust_1000.RData")
+
+
+#Load the pre-computed clustering results
+load(clust_robust, file = "clust_robust_1000.RData")
+hc <- clust_robust[[6]][["consensusTree"]] # 6th element because I want 6 clusters
+clusters <- as.data.frame(clust_robust[[6]][["consensusClass"]])
+
+#Remove the clust_robust object (it takes almost 3GB of RAM)
+rm(clust_robust)
+```
+
+```{r Visualise results}
+#Make the heatmap
+pheatmap(hmap_genes_cancer, 
+         show_colnames = FALSE,
+         annotation_col = rnaseq_annot[, top_drivers],
+         cluster_cols = hc,
+         clustering_method = "complete",
+         annotation_row = gene_annot,
+         annotation_names_row = F,
+         treeheight_col = 100, 
+         treeheight_row = 0,
+         cutree_cols = 6,
+         fontsize_row = 6,
+         annotation_colors = c(list(Sample_type = c(Cancer = "firebrick1", Control = "deepskyblue")), mut_colours))
+
+#Add cluster annotation
+colnames(clusters) <- "Cluster_ID"
+rnaseq_annot <- merge(x = rnaseq_annot, y = clusters, by = "row.names")
+rownames(rnaseq_annot) <- rnaseq_annot$Row.names
+rnaseq_annot$Row.names <- NULL
+rnaseq_annot$Cluster_ID <- as.character(rnaseq_annot$Cluster_ID)
+
+pheatmap(hmap_genes_cancer, 
+         show_colnames = FALSE,
+         filename = "robust_1000_k_3_cancer_annot.pdf", 
+         annotation_col = rnaseq_annot[, c(top_drivers, "Cluster_ID")],
+         cluster_cols = hc,
+         clustering_method = "complete",
+         annotation_row = gene_annot,
+         annotation_names_row = F,
+         treeheight_col = 100, 
+         treeheight_row = 0,
+         cutree_cols = 6,
+         fontsize_row = 6,
+         annotation_colors = c(list(Sample_type = c(Cancer = "firebrick1", Control = "deepskyblue")), mut_colours))
+```
+
+### Do Fisher's exact test on CCP clusters
+```{r Fishers exact test}
+rnaseq_annot$Cluster_ID <- NULL #Make sure there is no previous IDs
+rnaseq_annot_cancer <- merge(x = rnaseq_annot, y = clusters, by = "row.names")
+rownames(rnaseq_annot_cancer) <- rnaseq_annot_cancer$Row.names
+rnaseq_annot_cancer$Row.names <- NULL
+rnaseq_annot_cancer$Cluster_ID <- as.factor(rnaseq_annot_cancer$Cluster_ID)
+
+
+for (cluster in unique(clusters$Cluster_ID)){
+  
+      for (gene in cosmic_list){
+      fisher_data <- rnaseq_annot_cancer[which(rnaseq_annot_cancer$Sample_type ==  "Cancer"), c(gene, "Cluster_ID")]
+      
+      fisher_matrix <- matrix(c(length(which(fisher_data[, gene] == 1 & fisher_data[, "Cluster_ID"] == cluster)),
+                                length(which(fisher_data[, gene] == 0 & fisher_data[, "Cluster_ID"] == cluster)),
+                                length(which(fisher_data[, gene] == 1 & fisher_data[, "Cluster_ID"] != cluster)),
+                                length(which(fisher_data[, gene] == 0 & fisher_data[, "Cluster_ID"] != cluster))), nrow = 2, byrow = TRUE)
+      rownames(fisher_matrix) <- c("c_interest", "rest")
+      colnames(fisher_matrix) <- c("MU", "WT")
+      
+      f <- fisher.test(fisher_matrix)
+      
+      if (gene == cosmic_list[1] && cluster == clusters[1]){
+      l <- length(unique(clusters$Cluster_ID))
+      results <- vector(mode = "list", length = l)
+      for (i in 1:l){
+        results[[i]] <- data.frame()
+      }
+      }
+      
+      results[[cluster]][gene, "p_val"] <- f$p.value
+      results[[cluster]][gene, "odds"] <- f$estimate
+      results[[cluster]][gene, "WT_cluster"] <- fisher_matrix["c_interest", "WT"]
+      results[[cluster]][gene, "MU_cluster"] <- fisher_matrix["c_interest", "MU"]
+      results[[cluster]][gene, "WT_rest"] <- fisher_matrix["rest", "WT"]
+      results[[cluster]][gene, "MU_rest"] <- fisher_matrix["rest", "MU"]
+      results[[cluster]][gene, "gene"] <- gene
+      results[[cluster]][gene, "cluster"] <- cluster
+      }
+}
+
+#Remove spuious associations: multiple testing corrections
+# p.adjust(vector.of.associations, method=BH)
+#Default: boniferroni correction
+results <- bind_rows(results)
+results$p_adj <- p.adjust(results$p_val, method = "BH")
+results <- subset(results, p_adj<0.05)
+results$p_adj_star <- stars.pval(results$p_adj)
+write.csv(results, file = paste0(Sys.Date(), "_Fisher_test_CCP.csv"))
+```
+
+
+### Hypoxia induced factors in k 6
+```{r}
+for (tumour in solid_tumours){
+  #Indicate progress
+  print(paste0(tumour, ": This is ", match(tumour, solid_tumours), " out of ", length(solid_tumours)))
+  
+  file_cancer <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga-t.txt.gz")
+  cancer <- read.delim(file_cancer)
+  
+  rownames(cancer) <- cancer$Hugo_Symbol
+  cancer <- cancer[c("VHL", "HIF1A", "EPAS1"), c(-1, -2)]
+  
+  if (tumour == solid_tumours[1]){
+    rnaseq_gg <- cancer
+  } else {
+    rnaseq_gg <- cbind(rnaseq_gg, cancer)
+  }
+}
+
+rnaseq_gg <- rnaseq_gg[, -c(grep("TCGA.38.4625.", x = colnames(rnaseq_gg)))]
+#Scale
+rnaseq_gg <- log2(rnaseq_gg+1)
+expr_gg <- as.data.frame(t(rnaseq_gg))
+
+VHL_mutants <- rnaseq_annot[rnaseq_annot$VHL == 1, ]  #Find patients with VHL mutations
+VHL_mutants <- rownames(VHL_mutants)  #Make a vector with patient IDs
+
+
+expr_gg <- subset(expr_gg, rownames(expr_gg) %in% VHL_mutants)
+expr_gg <- merge(expr_gg, clusters, by = "row.names")
+expr_gg$Row.names <- NULL
+expr_gg$Cluster_ID <- mapvalues(expr_gg$Cluster_ID, from = as.character(1:5), to = rep("other", 5))
+expr_gg <- melt(expr_gg, id.vars = "Cluster_ID", variable.name = "Gene", value.name = "Expr")
+
+comparisons <- list(c("6", "other"))
+
+p <- ggplot(expr_gg, aes(x = Cluster_ID, y = Expr, group = Cluster_ID, fill = Cluster_ID)) +
+  geom_boxplot() +
+  facet_wrap(~Gene, scales = "free") +
+  xlab("Cluster") +
+  ylab("log2(Expression)") +
+  theme_pubr(legend = "none") +
+  scale_fill_manual(values = c("#00AFBB", "#E7B800")) +
+  theme(text = element_text(family = "Helvetica")) +
+  stat_compare_means(comparisons = comparisons, label = "p.signif") + # Add pairwise comparisons p-value
+  stat_compare_means(label.y = 15)
+
+save_plot(p, filename = paste0(Sys.Date(), "_HIFs_boxplot.svg"), base_width = 8)
+save_plot(p, filename = paste0(Sys.Date(), "_HIFs_boxplot.pdf"), base_width = 8)
+```
+
+
+
+## Section 4: Investigating correlation between APOBEC, dormancy, and exhaustion programmes
+```{r Visualise correlation between gene sets}
+all_markers_list <- list("apobec" = apobec_list, "dormancy" = dormancy_list, "exhaustion" = exhaustion_list)
+combs <- combinations(n=3, r=2)
+
+for (n in 1:nrow(combs)){
+
+genes1 <- all_markers_list[[combs[n, 1]]]
+genes2 <- all_markers_list[[combs[n, 2]]]
+name1 <- names(all_markers_list[combs[n, 1]])
+name2 <- names(all_markers_list[combs[n, 2]])
+
+correlation <- cor(t(rnaseq_cancer[c(genes1, genes2), ]), use = "pairwise.complete.obs")
+correlation <- as.matrix(correlation[genes1, genes2])
+corrplot(correlation)
+
+pdf(file = paste(Sys.Date(), "correlation", name1, name2, ".pdf", sep = "_"), height = 6, width = 10)
+corrplot(correlation,
+         method = "color",
+         tl.col = "black",
+         tl.cex = 1.2,
+         cl.cex = 1.2)
+dev.off()
+}
+```
+
+```{r Image for the dissertation}
+correlation <- cor(t(rnaseq_cancer), use = "pairwise.complete.obs")
+p.vals <- cor.mtest(correlation)$p
+
+dimnames(p.vals) <- dimnames(correlation)
+
+pdf(paste0(Sys.Date(), "_programme_corr.pdf"), width = 9, height = 3)
+corrplot(correlation[apobec_list, c(dormancy_list, exhaustion_list)],
+         method = "color",
+         insig = "label_sig",
+         p.mat = p.vals[apobec_list, c(dormancy_list, exhaustion_list)],
+         cl.pos = "r",
+         cl.ratio = 0.06,
+         cl.length = 5,
+         pch.cex = 1.4,
+         is.corr = T,
+         tl.col = "black")
+dev.off()
+```
+
+
+
+```{r 31/03/2020 - validate correlations}
+genes <- setdiff(rownames(rnaseq_cancer_all), all_genes_list)
+
+#calculate for random programmes
+random_expr <- data.frame(row.names = colnames(rnaseq_cancer_all))
+set.seed(2020)
+for (i in 1:1000){
+  random_genes <- sample(genes, size = 19, replace = FALSE)
+  expr <- rnaseq_cancer_all[random_genes, ]
+  random_expr[, i]  <- apply(expr, function (x) mean(x), MARGIN = 2)  #Get a mean value of expression across the genes in random programme
+}
+random_expr_mean <- apply(random_expr, function (x) mean(x), MARGIN = 1) #Get a mean programme expression value for every patient
+
+
+#Calculate for actual programmes
+prog_expr <- data.frame(row.names = colnames(rnaseq_cancer_all))
+prog_expr$mean_APOBEC <- apply(rnaseq_cancer_all[apobec_list, ], function (x) mean(x, na.rm = T), MARGIN = 2)
+prog_expr$Dormancy <- apply(rnaseq_cancer_all[dormancy_list, ], function (x) mean(x), MARGIN = 2)
+prog_expr$Exhaustion <- apply(rnaseq_cancer_all[exhaustion_list, ], function (x) mean(x), MARGIN = 2)
+
+
+#Do the t test
+t.test(x = random_expr_mean, y = prog_expr$mean_APOBEC, paired = TRUE)
+t.test(x = random_expr_mean, y = prog_expr$Dormancy, paired = TRUE)
+t.test(x = random_expr_mean, y = prog_expr$Exhaustion, paired = TRUE)
+```
+
+
+
+
+```{r}
+save(maf_all.lenient, file = "maf_all.lenient.RData")
+save(maf_all.strict, file = "maf_all.strict.RData")
+
+save(rnaseq_cancer, file = "rnaseq_cancer.RData")
+save(rnaseq_ctrl, file = "rnaseq_ctrl.RData")
+save(rnaseq_annot, file = "rnaseq_annot.RData")
+```
+
+
+
+
+```{r Driver list from paper - currently not in use}
+driver_table <- read.csv("driver_list.csv")
+driver_table$Pancan.Frequency <- str_remove(driver_table$Pancan.Frequency, "%") %>% as.numeric()
+driver_list <- driver_table %>% filter(Cancer == "PANCAN") %>% arrange(desc(Pancan.Frequency)) %>% select(Gene)
+driver_list <- as.character(driver_list$Gene[1:20])
+rm(driver_table)
+```
+
+```{r Function to assign mutated/non-mutated state}
+detect.mutations <- function(variant, SIFT, PolyPhen){
+
+  if (variant %in% c("Missense_Mutation",
+                      "Nonsense_Mutation",
+                      "Nonstop_Mutation",
+                      "Frameshift_Deletion",
+                      "Frameshift_Insertion",
+                      "Inframe_Insertion",
+                      "Inframe_Deletion")) {
+    variant <- as.numeric(1)
+  } else {
+    variant <- as.numeric(0)
+  }
+  return(variant)
+}
+
+#Example: normal
+#detect.mutations("TCGA-BT-A2LB-01A", "HAVCR2", maf_all)
+#Example: mutated
+#detect.mutations("TCGA-KQ-A41O-01A", "ANGPT1", maf_all)
+```
+
+```{r Assign mutations to the samples - not in use now}
+maf_cancer <- data.frame("Patient" = colnames(rnaseq_cancer))
+maf_cancer$Patient_short <- sapply(maf_cancer$Patient,
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+  #Remove duplicates (some patient samples processed twice)
+  # n=42
+maf_cancer <- maf_cancer[!duplicated(maf_cancer$Patient_short), ]
+
+maf_ctrl <- data.frame("Patient" = colnames(rnaseq_ctrl))
+maf_ctrl$Patient_short <- sapply(maf_ctrl$Patient,
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+  #Remove duplicates (some patient samples processed twice)
+  # n=1
+maf_ctrl <- maf_ctrl[!duplicated(maf_ctrl$Patient_short), ]
+
+for (gene in c(all_genes_list, driver_list)){
+  print(gene)
+  
+  maf_cancer[, gene] <- sapply(maf_cancer$Patient_short, function(x) detect.mutations(patient = x, gene = gene, ref_maf = maf_all))
+  
+  maf_ctrl[, gene] <- sapply(maf_ctrl$Patient_short, function(x) detect.mutations(patient = x, gene = gene, ref_maf = maf_all))
+}
+
+rownames(maf_cancer) <- maf_cancer$Patient_short
+rownames(maf_ctrl) <- maf_ctrl$Patient_short
+
+maf_summary <- maf_cancer[, colnames(maf_cancer) %in% all_genes_list]
+maf_summary <- as.data.frame(t(maf_summary))
+
+maf_summary$Sum <- rowSums(maf_summary)
+maf_summary$Gene <- rownames(maf_summary)
+maf_summary <- subset(maf_summary, select = c("Gene", "Sum"))
+
+
+
+maf_summary$Programme <- sapply(maf_summary$Gene, function(x) assign.programme(x))
+maf_summary <- subset(maf_summary, Programme != "None")
+
+maf_summary$Programme <- factor(maf_summary$Programme, levels = c("APOBEC", "Dormancy", "Exhaustion", "Multiple"))
+maf_summary$Gene <- factor(maf_summary$Gene, levels = all_genes_list)
+
+maf_summary$Nonmutated <- ncol(subset(maf_summary, select = -c(Gene, Sum, Programme))) - maf_summary$Sum
+maf_summary <- subset(maf_summary, select = colnames(maf_summary) %in% c("Gene", "Sum", "Programme", "Nonmutated"))
+
+# Plot using R basic graphics
+# barplot(height = maf_summary$Sum, names.arg = rownames(maf_summary))
+
+p1 <- ggplot(maf_summary, aes(y = Sum, x = Gene, fill = Programme)) +
+  geom_bar(stat="identity") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1), title = element_text(size=14)) +
+  ylab("Number of patients with deleterious mutation")
+p2 <- ggplot(maf_summary, aes(y = Sum, x = reorder(Gene, -Sum), fill = Programme)) +
+  geom_bar(stat="identity") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1), title = element_text(size=14)) +
+  ylab("Number of patients with deleterious mutation") +
+  xlab("Gene")
+
+save_plot(p1, filename = "/Users/wojciechlason/Documents/MSci Project/Graphs/no_mutations.pdf", base_height = 8, base_width = 12)
+save_plot(p2, filename = "/Users/wojciechlason/Documents/MSci Project/Graphs/no_mutations_sorted.pdf", base_height = 8, base_width = 12)
+```
+
+```{r}
+save(rnaseq_annot, prog_colours, mut_colours, top_drivers, gene_annot, cosmic_list, file = "Fisher_data.RData")
+```
+
+```{r}
+fisher.analyse <- function(annot_file, genes)
+```
+
+
+```{r}
+hmap_genes_cancer <- hmap_genes_cancer[, colSums(is.na(hmap_genes_cancer)) == 0]
+```
+
+## Dimensionality reduction analysis
+```{r R-installed PCA on cancer+control and gtex}
+gtex_pca <- prcomp(x = na.replace(t(hmap_genes_gtex), 0), center = TRUE, scale. = FALSE)
+
+ggbiplot(gtex_pca,
+         choices = c(1,3),
+         ellipse = FALSE,
+         groups = gtex_annot[match(colnames(hmap_genes_gtex), gtex_annot$Patient_long), "Sample_type"], 
+         var.axes = FALSE,
+         scale = 1)
+
+cancer_pca <- prcomp(x = t(hmap_genes_cancer), center = TRUE, scale. = FALSE)
+
+pca <- ggbiplot(cancer_pca,
+         choices = c(1,2),
+         ellipse = FALSE,
+         groups = rnaseq_annot[match(colnames(hmap_genes_cancer), rnaseq_annot$Patient_long), "Cancer"], 
+         var.axes = FALSE,
+         scale = 1) +
+  theme_pubr(legend = "none")
+
+ggbiplot(cancer_pca,
+         choices = c(1,2),
+         ellipse = FALSE,
+         groups = rnaseq_annot[match(colnames(hmap_genes_cancer), rnaseq_annot$Patient_long), "TP53"], 
+         var.axes = FALSE,
+         scale = 1)
+save_plot(pca, filename = paste(Sys.Date(), "pca_cancer.svg", sep="_"), base_height = 3, base_width = 4)
+```
+
+```{r PHATE}
+reticulate::use_python("/Users/wojciechlason/opt/miniconda3/bin/python", required = T)
+reticulate::py_config()
+library(phateR)
+
+gtex_phate <- phate(na.replace(t(hmap_genes_gtex), 0))
+ggplot(gtex_phate, aes(x=PHATE1, y=PHATE2, color = gtex_annot[match(colnames(hmap_genes_gtex), gtex_annot$Patient_long), "Sample_type"])) +
+  geom_point() +
+  theme(legend.title = element_blank())
+
+cancer_phate <- phate(na.replace(t(hmap_genes_cancer), 0))
+ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, color = rnaseq_annot[match(colnames(hmap_genes_cancer), rnaseq_annot$Patient_long), "Cancer"])) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  guides(color = guide_legend(override.aes = list(size=5)))
+
+ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, color = rnaseq_annot[match(colnames(hmap_genes_cancer), rnaseq_annot$Patient_long), "TP53"])) +
+  geom_point() +
+  labs(color = "P53") +
+  theme(legend.key.width = unit(1, "cm")) +
+  guides(color = guide_legend(override.aes = list(size=5)))
+```
+
+```{r}
+library(umap)
+umap_gtex <- umap(na.replace(t(hmap_genes_gtex), 0))
+aa <- as.data.frame(umap_gtex$layout)
+colnames(aa) <- c("UMAP1", "UMAP2")
+ggplot(aa, aes(x = UMAP1, y=UMAP2, color = gtex_annot[match(rownames(aa), gtex_annot$Patient_long), "Sample_type"])) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  guides(color = guide_legend(override.aes = list(size=5)))
+
+umap_cancer <- umap(t(hmap_genes_cancer))
+bb <- as.data.frame(umap_cancer$layout)
+colnames(bb) <- c("UMAP1", "UMAP2")
+umap <- ggplot(bb, aes(x = UMAP1, y=UMAP2, color = rnaseq_annot[match(rownames(bb), rnaseq_annot$Patient_long), "Cancer"])) +
+  geom_point() +
+  theme_pubr(legend = "none") +
+  theme(text = element_text(family = "Helvetica", size = 10))
+
+ggplot(bb, aes(x = UMAP1, y=UMAP2, color = rnaseq_annot[match(rownames(bb), rnaseq_annot$Patient_long), "TP53"])) +
+  geom_point() +
+  theme(legend.key.width = unit(1, "cm")) +
+  labs(color = "P53")
+  guides(color = guide_legend(override.aes = list(size=5)))
+  
+  
+save_plot(umap, filename = paste(Sys.Date(), "umap_cancer.svg", sep="_"), base_height = 3, base_width = 4)
+```
+
+```{r tSNE}
+library(M3C)
+
+tsne <- tsne(hmap_genes_cancer, dotsize = 1, labels = rnaseq_annot[match(rownames(bb), rnaseq_annot$Patient_long), "Cancer"], perplex = 30, axistextsize = 6) +
+  theme_pubr(legend = "none") +
+  xlab("TSNE1")+
+  ylab("TSNE2") +
+  theme(text = element_text(family = "Helvetica", size = 10))
+save_plot(tsne, filename = paste(Sys.Date(), "tsne_cancer.svg", sep="_"), base_height = 3, base_width = 4)
+```
+
+```{r M3C analysis of optimal K - not in use}
+rnaseq_annot_x <- as.data.frame(rnaseq_annot$Patient_long)
+rnaseq_annot_x$Cancer <- rnaseq_annot$Cancer
+colnames(rnaseq_annot_x) <- c("ID", "Cancer")
+rnaseq_annot_x <- subset(rnaseq_annot_x, ID %in% colnames(hmap_genes_cancer))
+M3C_results <- M3C(na.replace((hmap_genes_cancer), 0), des = rnaseq_annot_x, variable = "Cancer", cores = 2)
+```
+
+
+```{r Correcting for batch effect}
+library(sva)
+#Create adjustment matrix
+combat_df <- rnaseq_cancer[, colSums(is.na(rnaseq_cancer)) == 0]
+combat_both <- hmap_genes_both[, colSums(is.na(hmap_genes_both)) == 0]
+
+rownames(cancer_types) <- cancer_types$Patient_long
+batches <-  cancer_types[colnames(combat_df), ] #Batch information (which cancer the sample is from)
+
+batches_both <- subset(rnaseq_annot, rownames(rnaseq_annot) %in% colnames(combat_both), select = c("Patient_long", "Sample_type", "Cancer"))
+batches_both <- batches_both[colnames(combat_both), ]
+
+combat_cancer <- ComBat(dat = as.matrix(combat_df),
+                      batch = batches$Cancer,
+                      mod = NULL,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+
+combat_both <- ComBat(dat = as.matrix(combat_both),
+                      batch = batches_both$Cancer,
+                      mod = NULL,
+                      par.prior = TRUE,
+                      prior.plots = FALSE)
+#save(combat_both, combat_cancer, file = "combat.RData")
+```
+
+```{r PHATE for cancer}
+reticulate::use_python("/Users/wojciechlason/opt/miniconda3/bin/python", required = T)
+reticulate::py_config()
+library(phateR)
+
+cancer_phate <- phate(t(combat_cancer))
+
+ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, color = batches$Cancer)) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  guides(color = guide_legend(override.aes = list(size=5)))
+
+expr <- data.frame(row.names = colnames(combat_df))
+expr$mean_APOBEC <- apply(combat_df[apobec_list, ], function (x) mean(x), MARGIN = 2)
+expr$Dormancy <- apply(combat_df[dormancy_list, ], function (x) mean(x), MARGIN = 2)
+expr$Exhaustion <- apply(combat_df[exhaustion_list, ], function (x) mean(x), MARGIN = 2)
+
+ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, colour = expr$mean_APOBEC)) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  scale_color_gradient2(low = "red", midpoint = 4, mid = "blue", high = "green") +
+  ggtitle("Mean APOBEC subunits expression")
+
+ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, colour = expr$Exhaustion)) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  scale_color_gradient2(low = "red", midpoint = 4, mid = "blue", high = "green") +
+  ggtitle("Exhaustion programme expression")
+
+ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, colour = expr$Dormancy)) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  scale_color_gradient2(low = "red", midpoint = 4, mid = "blue", high = "green") +
+  ggtitle("Dormancy programme expression")
+
+ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, color = batches$TP53)) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  ggtitle("TP53 mutations")
+```
+
+
+```{r Take one programme, see how it compares with others}
+programs <- list("Dormancy" = dormancy_list, "Exhaustion" = exhaustion_list, "mean_APOBEC" = apobec_list)
+
+for(plot_vector in list(c(1, 2, 3), c(2, 1, 3), c(3, 1, 2))){
+  plot_vector <- unlist(plot_vector)
+  
+  geneset <- programs[[plot_vector[1]]]
+  phate <- phate(t(combat_cancer[geneset, ]))
+  
+  name_big <- names(programs)[plot_vector[1]]
+  name_p1 <- names(programs)[plot_vector[2]]
+  name_p2 <- names(programs)[plot_vector[3]]
+  
+  p_left <- ggplot(phate, aes(x=PHATE1, y=PHATE2, colour = expr[, name_big])) +
+    geom_point() +
+    theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+    scale_color_gradient2(low = "red", midpoint = mean(expr[, name_big]), mid = "blue", high = "green") +
+    ggtitle(name_big)
+  
+  p1 <- ggplot(phate, aes(x=PHATE1, y=PHATE2, colour = expr[, name_p1])) +
+    geom_point() +
+    theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+    scale_color_gradient2(low = "red", midpoint = mean(expr[, name_p1]), mid = "blue", high = "green") +
+    ggtitle(name_p1)
+  
+  p2 <- ggplot(phate, aes(x=PHATE1, y=PHATE2, colour = expr[, name_p2])) +
+    geom_point() +
+    theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+    scale_color_gradient2(low = "red", midpoint = mean(expr[, name_p2]), mid = "blue", high = "green") +
+    ggtitle(name_p2)
+  
+  p_right <- plot_grid(p1, p2, ncol = 1)
+  p_final <- plot_grid(p_left, p_right, rel_widths = c(2, 1))
+  
+  save_plot(p_final, filename = paste(Sys.Date(), name_big, "vs_others.pdf", sep = "_"), base_height = 12, base_width = 18)
+  
+  rm(p1, p2, name_big, name_p1, name_p2, p_left, p_right, phate)
+}
+```
+
+
+```{r PHATE for cancer/control}
+both_phate <- phate(t(combat_both))
+
+ggplot(both_phate, aes(x=PHATE1, y=PHATE2, color = batches_both$Cancer)) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  guides(color = guide_legend(override.aes = list(size=5)))
+
+ggplot(both_phate, aes(x=PHATE1, y=PHATE2, color = batches_both$Sample_type)) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  guides(color = guide_legend(override.aes = list(size=5)))
+
+expr <- as.data.frame(t(combat_both))
+expr$mean_APOBEC <- apply(expr[, apobec_list], function (x) mean(x), MARGIN = 1)
+expr$Dormancy <- apply(expr[, dormancy_list], function (x) mean(x), MARGIN = 1)
+expr$Exhaustion <- apply(expr[, exhaustion_list], function (x) mean(x), MARGIN = 1)
+
+for(prog in c("mean_APOBEC", "Dormancy", "Exhaustion")){
+
+dat1 <- as.data.frame(both_phate)[rownames(as.data.frame(both_phate)) %in% colnames(rnaseq_ctrl), ]
+dat2 <- as.data.frame(both_phate)[rownames(as.data.frame(both_phate)) %in% colnames(rnaseq_cancer), ]
+col1 <- expr[rownames(expr) %in% rownames(dat1), prog]
+col2 <- expr[rownames(expr) %in% rownames(dat2), prog]
+
+p <- ggplot() +
+        geom_point(data=dat1, aes(x=PHATE1, y=PHATE2, colour=col1), shape=16, size=3, alpha = 0.8) +
+        scale_color_gradient2(low = "red", midpoint = mean(col1), mid = "blue", high = "cyan") +
+        geom_point(data= dat2, aes(x=PHATE1, y=PHATE2, fill=col2), shape=21, size=3, colour = "transparent") +
+        scale_fill_gradient2(low = "darkorange2", midpoint = mean(col2), mid = "yellow ", high = "darkgreen") +
+        labs(colour="Control", fill="Cancer") +
+        ggtitle(ifelse(prog=="mean_APOBEC", yes = "Mean expression of APOBEC subunits", no = prog))
+
+print(p)
+save_plot(p, filename = paste(Sys.Date(), prog, "control_cancer_batch_adjusted.pdf", sep = "_"), base_height = 6)
+}
+
+```
+
+
+```{r}
+tsne(combat_cancer, dotsize = 1, labels = batches$Cancer, perplex = 30, axistextsize = 6)
+```
+
+```{r}
+pdf("pie_charts.pdf", 12, 6)
+par(mfrow=c(1,2))
+pie(table(batches_both$Cancer), col = brewer.pal(14, name = "Set3"))
+pie(table(batches_both$Sample_type), col = brewer.pal(2, name = "Set3"))
+dev.off()
+```
+
+
+## Hypoxia analysis
+```{r Curate hypoxia signatures}
+brca <- read.delim("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/brca-rsem-fpkm-tcga.txt.gz")
+
+hypoxia_winter <- unique(scan("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/hypoxia/winter list.csv", sep = ",", what = "character"))
+hypoxia_west <- scan("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/hypoxia/west list.csv", sep = ",", what = "character")
+hypoxia_buffa <- scan("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/hypoxia/buffa list.csv", sep = ",", what = "character")
+
+setdiff(hypoxia_winter, intersect(hypoxia_winter, brca$Hugo_Symbol))
+hypoxia_winter <- revalue(hypoxia_winter, c("C20orf20" = "MRGBP",
+                                            "AFARP1" = "AKR7A2P1",
+                                            "BMS1L" = "BMS1",
+                                            "HSPC163" = "CNIH4",
+                                            "IMP-2" = "IGF2BP2",
+                                            "KIAA1393" = "KIAA1393",
+                                            "MGC2654" = "METTL22",
+                                            "TUBB2" = "TUBB2A",
+                                            "VEGF" = "VEGFA",
+                                            "VEZATIN" = "VEZT",
+                                            "AD-003" = "NTMT1",
+                                            "C14orf156" = "SLIRP",
+                                            "C15orf25" = "HAUS2",
+                                            "CTEN" = "TNS4",
+                                            "DKFZP564D166" = "TANC2",
+                                            "GAPD" = "GAPDH",
+                                            "HIG2" = "HILPDA",
+                                            "Kua" = "TMEM189",
+                                            "LOC56901" = "NDUFA4L2",
+                                            "Lrp2bp" = "LRP2BP",
+                                            "MGC14560" = "GPN3",
+                                            "MGC17624" = "C16orf74",
+                                            "MGC2408" = "ECE2",
+                                            "PDZK11" = "PDZD11",
+                                            "PPP2CZ" = "PPM1J",
+                                            "SIP1" = "GEMIN2",
+                                            "SLC6A10" = "SLC6A10P",
+                                            "SMILE" = "TMTC3"))
+setdiff(hypoxia_winter, intersect(hypoxia_winter, brca$Hugo_Symbol))
+#LOC14946 is actually missing, rest of the "old" gene names replaced
+hypoxia_winter <- setdiff(hypoxia_winter, c("LOC14946", "AKR7A2P1", "KIAA1393", "LOC14946", "SLC6A10P"))
+
+
+setdiff(hypoxia_west, intersect(hypoxia_west, brca$Hugo_Symbol))
+hypoxia_west <- revalue(hypoxia_west, c("C20orf20" = "MRGBP",
+                                        "HIG2" = "HILPDA",
+                                        "MPRS17" = "MRPS17"))      #typo??
+setdiff(hypoxia_west, intersect(hypoxia_west, brca$Hugo_Symbol))
+
+
+setdiff(hypoxia_buffa, intersect(hypoxia_buffa, brca$Hugo_Symbol))
+hypoxia_buffa <- revalue(hypoxia_buffa, c("C20orf20" = "MRGBP",
+                                          "HIG2" = "HILPDA",
+                                          "NP" = "PNP",
+                                          "CTSL2" = "CTSV",
+                                          "AK3L1" = "AK4")) 
+setdiff(hypoxia_buffa, intersect(hypoxia_buffa, brca$Hugo_Symbol))
+
+
+rm(brca)
+```
+
+```{r Calculations for Venn diagram}
+length(intersect(hypoxia_buffa, hypoxia_west))
+length(intersect(hypoxia_buffa, hypoxia_winter))
+length(intersect(hypoxia_winter, hypoxia_west))
+length(intersect(hypoxia_winter, intersect(hypoxia_buffa, hypoxia_west)))
+```
+
+
+```{r Download hypoxia data for hypoxia (visualization purposes)}
+hypoxia <- list("Buffa" = hypoxia_buffa, "Winter" = hypoxia_winter, "West" = hypoxia_west)
+
+for (tumour in solid_tumours){
+  #Indicate progress
+  print(paste0("HYPOXIA: ", str_to_upper(tumour), ": This is ", match(tumour, solid_tumours), " out of ", length(solid_tumours)))
+  
+  file_cancer <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga-t.txt.gz")
+  file_ctrl <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga.txt.gz")
+  
+  cancer <- read.delim(file_cancer)
+  ctrl <- read.delim(file_ctrl)
+  
+  rownames(cancer) <- cancer$Hugo_Symbol
+  cancer <- cancer[unlist(hypoxia), c(-1, -2)]
+  
+  rownames(ctrl) <- ctrl$Hugo_Symbol
+  ctrl <- ctrl[unlist(hypoxia), c(-1, -2)]
+  
+  cancer_type <- data.frame("Patient_long" = c(colnames(cancer), colnames(ctrl)))
+  cancer_type$Cancer <- as.character(tumour)
+  
+  if (tumour == solid_tumours[1]){
+    hypoxia_cancer <- cancer
+    hypoxia_ctrl <- ctrl
+    cancer_types <- cancer_type
+  } else {
+    hypoxia_cancer <- cbind(hypoxia_cancer, cancer)
+    hypoxia_ctrl <- cbind(hypoxia_ctrl, ctrl)
+    cancer_types <- rbind(cancer_types, cancer_type)
+  }
+}
+rm(tumour, file_cancer, file_ctrl, cancer, ctrl, cancer_type)
+
+#Remove outlier:
+hypoxia_cancer <- hypoxia_cancer[, -c(grep("TCGA.38.4625.", x = colnames(hypoxia_cancer)))]
+hypoxia_ctrl <- hypoxia_ctrl[, -c(grep("TCGA.38.4625.", x = colnames(hypoxia_ctrl)))]
+
+
+hypoxia_cancer <- log2(hypoxia_cancer+1)
+hypoxia_ctrl <- log2(hypoxia_ctrl+1)
+```
+
+```{r Overlay hypoxia on PHATE}
+ggplot(both_phate, aes(x=PHATE1, y=PHATE2, color = batches_both$Cancer)) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  guides(color = guide_legend(override.aes = list(size=5)))
+```
+
+## Hypoxia expression on PHATE plots
+```{r}
+hypoxia_scores <- data.frame(row.names = colnames(hypoxia_cancer))
+hypoxia_scores$West <- apply(hypoxia_cancer[hypoxia_west, ], function (x) mean(x), MARGIN = 2)
+#Margin is 2 and selecting rows, because in hypoxia_cancer columns are patients, but in hypoxia_scores, rows are patients
+hypoxia_scores$Winter <- apply(hypoxia_cancer[hypoxia_winter, ], function (x) mean(x), MARGIN = 2)
+hypoxia_scores$Buffa <- apply(hypoxia_cancer[hypoxia_buffa, ], function (x) mean(x), MARGIN = 2)
+
+cols <- list(c("blue", "orange"), c("red", "green"), c("gold1", "purple"))
+
+for(sig_name in names(hypoxia)){
+i <- match(sig_name, names(hypoxia))   #Create colour index
+col1 <- cols[[i]][1]
+col2 <- cols[[i]][2]
+
+p1 <- ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2,
+                         colour = scale(hypoxia_scores[which(rownames(hypoxia_scores) %in% colnames(combat_cancer)), sig_name]))) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  scale_color_gradient(low = col1, high = col2)
+
+p2 <- ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2,
+                         colour = scale(hypoxia_scores[which(rownames(hypoxia_scores) %in% colnames(combat_cancer)), sig_name]))) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  scale_color_gradient2(low = col1, mid = alpha("gray80", 0.2), midpoint = 0, high = col2)
+
+grid <- plot_grid(p1, p2, nrow = 1, labels = c(paste0("Hypoxia signature: ", sig_name), "Remove centre points"))
+save_plot(plot = grid, filename = paste(Sys.Date(), "PHATE_hypoxia", sig_name, "signature.pdf", sep = "_"), base_height = 4, base_width = 12)
+print(grid)
+}
+```
+
+## Analysis of extreme PHATE patients
+```{r}
+find_extremes <- function(value, min = -0.025, max = 0.025){
+  if (value <= min){
+    return("low")
+  } else if (value >= max) {
+    return("high")
+  } else {
+    return("mid")
+  }
+}
+
+extreme_patients <- as.data.frame(cancer_phate)
+extreme_patients$score <- sapply(extreme_patients$PHATE1, function(x) find_extremes(value = x))
+extreme_patients$Patient_long <- rownames(extreme_patients)
+```
+
+### Fisher's exact for extreme patients
+```{r}
+fisher_extremes <- merge(x = extreme_patients, y = rnaseq_annot, by = "Patient_long")
+
+for (tail in c("low", "high")){
+  
+      for (gene in cosmic_list){
+      fisher_data <- fisher_extremes[, c(gene, "score")]
+      
+      fisher_matrix <- matrix(c(length(which(fisher_data[, gene] == 1 & fisher_data[, "score"] == tail)),
+                                length(which(fisher_data[, gene] == 0 & fisher_data[, "score"] == tail)),
+                                length(which(fisher_data[, gene] == 1 & fisher_data[, "score"] != tail)),
+                                length(which(fisher_data[, gene] == 0 & fisher_data[, "score"] != tail))), nrow = 2)
+      
+      rownames(fisher_matrix) <- c("tail", "rest")
+      colnames(fisher_matrix) <- c("MU", "WT")
+      
+      f <- fisher.test(fisher_matrix)
+      
+      if (gene == cosmic_list[1] && tail == "low"){
+      l <- 2
+      results <- vector(mode = "list", length = l)
+      for (i in 1:l){
+        results[[i]] <- data.frame()
+      }
+      }
+      n <- match(tail, c("low", "high"))
+      results[[n]][gene, "p_val"] <- f$p.value
+      results[[n]][gene, "odds"] <- f$estimate
+      results[[n]][gene, "WT"] <- fisher_matrix["tail", "WT"]
+      results[[n]][gene, "MU"] <- fisher_matrix["tail", "MU"]
+      results[[n]][gene, "gene"] <- gene
+      results[[n]][gene, "tail"] <- tail
+      }
+}
+
+results_all <- bind_rows(results)
+results_all$p_adj <- p.adjust(results_all$p_val, method = "BH")
+results_all <- subset(results_all, p_adj<0.05)
+results_all$p_adj_star <- stars.pval(results_all$p_adj)
+
+write.csv(results_all, file = paste0(Sys.Date(), "_Fisher_exact_test_tails.csv"))
+
+ggplot(extreme_patients, aes(x=PHATE1, y=PHATE2, color = score)) +
+  geom_point() +
+  theme(legend.key.width = unit(1, "cm"), legend.title = element_blank()) +
+  guides(color = guide_legend(override.aes = list(size=5))) +
+  scale_color_manual(values = c("low" = "firebrick1", "mid" = "gray80", "high" = "deepskyblue"))
+  
+```
+
+```{r}
+#BiocManager::install("BSgenome")
+#install.packages("deconstructSigs")
+BiocManager::install("BSgenome.Hsapiens.UCSC.hg38")
+```
+
+```{r Download MAF for the purpose of signature analysis}
+solid_tumours <- str_to_upper(solid_tumours)
+
+for (tumour in solid_tumours){
+  print(paste0(tumour, ": This is ", which(tumour == solid_tumours), " out of ", length(solid_tumours)))
+  df.maf <- GDCquery_Maf(tumour, pipelines = "muse")
+  df.maf.short <- df.maf[,c("Hugo_Symbol",
+                            "Tumor_Sample_Barcode",
+                            "Chromosome",
+                            "Start_Position","End_Position",
+                            "Reference_Allele",
+                            "Tumor_Seq_Allele2")]
+  df.maf.short$Cancer <- as.character(tumour)
+  df.maf.short <- subset(df.maf.short, Hugo_Symbol %in% all_genes_list & Start_Position == End_Position)
+
+  if (tumour == solid_tumours[1]){
+    maf_sigs <- df.maf.short
+  } else {
+    maf_sigs <- rbind(maf_sigs, df.maf.short)
+  }
+  rm(df.maf, df.maf.short)
+}
+save(maf_sigs, file = "maf_sigs.RData")
+```
+
+
+```{r}
+library(deconstructSigs)
+library(BSgenome.Hsapiens.UCSC.hg38)
+sigs.input <- mut.to.sigs.input(mut.ref = as.data.frame(maf_sigs), 
+                                sample.id = "Tumor_Sample_Barcode", 
+                                chr = "Chromosome", 
+                                pos = "Start_Position", 
+                                ref = "Reference_Allele", 
+                                alt = "Tumor_Seq_Allele2",
+                                bsg = BSgenome.Hsapiens.UCSC.hg38)
+
+sigs <- NULL
+i <- 0
+for (sample in rownames(sigs.input)) {
+  i <- i+1
+  print(i)
+  sigs_1 = whichSignatures(tumor.ref = sigs.input, 
+                             signatures.ref = signatures.cosmic,
+                             sample.id = sample, 
+                             contexts.needed = TRUE,
+                             signature.cutoff = 0,
+                             tri.counts.method = 'default')
+  sigs <- rbind(sigs,sigs_1$weights)
+  
+}
+
+write.csv(sigs, file="mutational_signatures.csv")
+
+gg_data <- data.frame("Signature" = colnames(sigs), "Prevalence" = colSums(sigs))
+gg_data$Signature <- as.integer(str_remove(gg_data$Signature, "Signature\\."))
+gg_data$Fill <- c(0, 1, rep(0, 10), 1, rep(0,17))
+ggplot(gg_data, aes(y = Prevalence, x = as.factor(Signature), fill = as.factor(Fill))) +
+  geom_bar(stat = "identity", position = position_dodge(width = 2)) +
+  theme(legend.position = "none", axis.text.x = element_text(size=10)) +
+  labs(x = "Signature", y = "Total weight")
+```
+
+
+```{r Import signature annotations}
+SBS_annot <- read.csv("SBS_annotation.csv")
+```
+
+
+```{r}
+solid_tumours <- str_to_upper(solid_tumours)
+
+for(tumour in solid_tumours){
+  path <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/SignatureProfiles/sigs.", tumour, ".Synapse2019.Filtered.Rdata")
+  tryCatch(load(path), error=function(e) next)
+}
+
+sigs_all <- rbind(sigs.BLCA.Synapse2019,sigs.BRCA.Synapse2019,sigs.CESC.Synapse2019,sigs.CHOL.Synapse2019,sigs.COAD.Synapse2019,sigs.ESCA.Synapse2019,sigs.HNSC.Synapse2019,sigs.KICH.Synapse2019,sigs.KIRC.Synapse2019,sigs.KIRP.Synapse2019,sigs.LIHC.Synapse2019,sigs.LUAD.Synapse2019,sigs.LUSC.Synapse2019,sigs.PRAD.Synapse2019,sigs.STAD.Synapse2019,sigs.THCA.Synapse2019,sigs.UCEC.Synapse2019)
+
+rm(sigs.BLCA.Synapse2019,sigs.BRCA.Synapse2019,sigs.CESC.Synapse2019,sigs.CHOL.Synapse2019,sigs.COAD.Synapse2019,sigs.ESCA.Synapse2019,sigs.HNSC.Synapse2019,sigs.KICH.Synapse2019,sigs.KIRC.Synapse2019,sigs.KIRP.Synapse2019,sigs.LIHC.Synapse2019,sigs.LUAD.Synapse2019,sigs.LUSC.Synapse2019,sigs.PRAD.Synapse2019,sigs.STAD.Synapse2019,sigs.THCA.Synapse2019,sigs.UCEC.Synapse2019)
+
+sigs_all$Patient_short <- sapply(rownames(sigs_all),
+                             function(x) paste(str_split(x, "-", simplify = T)[1:4], collapse = "-"))
+expr$Patient_short <- sapply(rownames(expr),
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+hypoxia_scores$Patient_short <- sapply(rownames(hypoxia_scores),
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+
+sig_corr <- merge(expr, sigs_all, by = "Patient_short")
+SBS_matrix <- cor(sig_corr[, 2:53])
+p_matrix <- cor.mtest(sig_corr[, 2:53])$p
+
+png(paste0(Sys.Date(), "_sigs_corr.png"), width = 6, height = 12, units = "in", res = 600)
+corrplot(SBS_matrix[4:52, c("mean_APOBEC", "Dormancy", "Exhaustion")],
+         method = "color",
+         insig = "label_sig",
+         p.mat = p_matrix[4:52, 1:3],
+         cl.pos = "b",
+         pch.cex = 1,
+         is.corr = F,
+         tl.col = "black",
+         cl.length = 3,
+         cl.cex = 0.8)
+dev.off()
+
+pdf("corr_programmes.pdf", width = 12, height = 2)
+corrplot(SBS_matrix[1:3, 7:52], method = "color", outline = T, is.corr = F, cl.cex = 0.5, p.mat = p_matrix[1:3, 7:52], insig = "label_sig")
+dev.off()
+
+pdf("corr_hypoxia.pdf", width = 12, height = 2)
+corrplot(SBS_matrix[4:6, 7:52], method = "color",  outline = T, is.corr = F, cl.cex = 0.5, p.mat = p_matrix[4:6, 7:52], insig = "label_sig")
+dev.off()
+```
+
+
+```{r}
+hypoxia_consensus <- intersect(hypoxia_buffa, intersect(hypoxia_west, hypoxia_winter))
+hypoxia_programmes <- list("Consensus" = hypoxia_consensus,
+                           "Buffa" = hypoxia_buffa,
+                           "West" = hypoxia_west,
+                           "Winter" = hypoxia_winter)
+
+for(i in 1:4){
+  prog <- hypoxia_programmes[[i]]
+  name <- names(hypoxia_programmes)[i]
+  
+    hypoxia_phate <- phate(na.replace(t(hypoxia_cancer[prog, rownames(expr)]), 0))
+    expr$Hypoxia <- apply(hypoxia_cancer[prog, rownames(expr)], function (x) mean(x), MARGIN = 2)
+    
+    p1 <- ggplot(hypoxia_phate, aes(x=PHATE1, y=PHATE2, color = expr$mean_APOBEC)) +
+      geom_point() +
+      theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+      scale_color_gradient2(low = "red", midpoint = mean(expr$mean_APOBEC), mid = "blue", high = "green") +
+      ggtitle("Mean APOBEC subunits expression")
+    p2 <- ggplot(hypoxia_phate, aes(x=PHATE1, y=PHATE2, color = expr$Exhaustion)) +
+      geom_point() +
+      theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+      scale_color_gradient2(low = "red", midpoint = mean(expr$Exhaustion), mid = "blue", high = "green") +
+      ggtitle("Exhaustion programme expression")
+    p3 <- ggplot(hypoxia_phate, aes(x=PHATE1, y=PHATE2, color = expr$Dormancy)) +
+      geom_point() +
+      theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+      scale_color_gradient2(low = "red", midpoint = mean(expr$Dormancy), mid = "blue", high = "green") +
+      ggtitle("Dormancy programme expression")
+    p4 <- ggplot(hypoxia_phate, aes(x=PHATE1, y=PHATE2, color = expr$Hypoxia)) +
+      geom_point() +
+      theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+      scale_color_gradient2(low = "gold1", midpoint = mean(expr$Hypoxia), mid = "red", high = "black") +
+      ggtitle(paste0("Hypoxia expression ", name))
+    
+    save_plot(plot_grid(p1, p2, p3, p4, nrow=2), filename = paste0(Sys.Date(), "_Hypoxia_PHATE_", name, ".png"), base_height = 8)
+    
+}
+
+hypoxia_phate <- phate(na.replace(t(hypoxia_cancer[hypoxia_consensus, rownames(expr)]), 0))
+hypoxia_clusters <- as.factor(cluster_phate(hypoxia_phate, k=3, seed=2020))
+hypoxia_clusters <- recode(hypoxia_clusters, "0" = "2", "1" = "1", "2" = "3")
+
+ggplot(hypoxia_phate, aes(x=PHATE1, y=PHATE2, color = hypoxia_clusters)) +
+  geom_point() +
+  annotate("text", x = c(-0.015, 0.01, 0.035), y = c(0, -0.005, 0.02), label = 1:3)
+
+hypoxia_clusters <- data.frame("Cluster" = hypoxia_clusters, "Patient_long" = rownames(hypoxia_phate$embedding))
+fisher_hypoxia <- merge(x = hypoxia_clusters, y = rnaseq_annot, by = "Patient_long")
+
+to_high <- fisher.WL(data = fisher_hypoxia,
+          genes = cosmic_list,
+          to_test = 3,
+          to_compare = 1:2)
+nrow(to_high)
+subset(to_high, MU>WT)
+
+write.csv(to_high, file = paste0(Sys.Date(), "_Fisher_k_clusters_hypoxia_consensus_high.csv"))
+```
+
+
+```{r}
+ggplot(hypoxia_phate, aes(x=PHATE1, y=PHATE2, colour = hypoxia_scores[rownames(expr), "Buffa"])) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  scale_color_gradient2(low = "red", midpoint = mean(expr$Dormancy), mid = "blue", high = "green") +
+  ggtitle("Dormancy programme expression")
+
+clusters <- phateR::cluster_phate(hypoxia_phate, k=3, seed=2020)
+
+ggplot(hypoxia_phate, aes(x=PHATE1, y=PHATE2, colour = as.factor(clusters))) +
+  geom_point() +
+  theme(legend.title = element_blank(), legend.key.width = unit(1, "cm")) +
+  ggtitle("Dormancy programme expression")
+
+ggplot(hypoxia_scores[rownames(expr),], aes(y=West, group=as.character(clusters))) +
+  geom_boxplot()
+```
+
+```{r}
+library(stringr)
+library(deconstructSigs, lib.loc = "~/R_packages")
+library(BSgenome.Hsapiens.UCSC.hg38, lib.loc = "~/R_packages")
+
+load("~/R_packages/deconstructSigs/data/signatures.exome.cosmic.v3.may2019.rda")
+solid_tumours <- c("blca", "brca", "cesc", "chol", "coad", "esca",  "hnsc", "kich", "kirc", "kirp", "lihc", "luad", "lusc", "prad", "stad", "thca", "ucec")
+solid_tumours <- str_to_upper(solid_tumours)
+
+
+for(pipe in c("muse", "somaticsniper", "somaticsniper", "varscan2")){
+  df.maf.all <- NULL
+    
+      for(tumour in solid_tumours){
+          assign('df.maf', get(load(paste0("~/4_pipelines_MAF_data/", tumour, "_", pipe, "_MAF_data.RData"))))
+          
+          df.maf.short <- df.maf[,c("Tumor_Sample_Barcode",
+                                    "Cancer",
+                                    "Hugo_Symbol","Chromosome",
+                                    "Start_Position","End_Position",
+                                    "Variant_Classification",
+                                    "Variant_Type",
+                                    "Reference_Allele",
+                                    "Tumor_Seq_Allele1",
+                                    "Tumor_Seq_Allele2",
+                                    "One_Consequence",
+                                    "Consequence",
+                                    "SIFT","PolyPhen")]
+          
+          # Only interested in point mutations, not small insertions/deletions:
+          df.maf.short <- df.maf.short[which(df.maf.short$Variant_Type == "SNP"),]
+          
+          # Annotating sample type:
+          df.maf.short$CodeType <- sapply(df.maf.short$Tumor_Sample_Barcode,
+                                          function(x) substr(strsplit(x,"-")[[1]][4],1,2))
+          df.maf.short$SampleType <- sapply(df.maf.short$CodeType,
+                                            function(x) ifelse(x=="01","PrimaryTumour",
+                                                               ifelse(x %in% c("10","11"),"Normal",
+                                                                      ifelse(x=="06","Metastasis","Other"))))
+          
+          df.maf.short <- df.maf.short[which(df.maf.short$SampleType %in% c("PrimaryTumour", "Normal"))]
+          
+          df.maf.all <- rbind(df.maf.all, df.maf.short)
+      }
+  
+  assign(paste0("df.maf_all", pipe), value = df.maf.all)
+  save(list = paste0("df.maf_all", pipe), file = paste0("df.maf_all", pipe, ".RData"))
+  
+      # Convert to deconstructSigs input:
+      sigs.input <- mut.to.sigs.input(mut.ref = as.data.frame(df.maf.all), 
+                                      sample.id = "Tumor_Sample_Barcode", 
+                                      chr = "Chromosome", 
+                                      pos = "Start_Position", 
+                                      ref = "Reference_Allele", 
+                                      alt = "Tumor_Seq_Allele2",
+                                      bsg = BSgenome.Hsapiens.UCSC.hg38)
+      
+      sigs <- NULL
+      for (sample in rownames(sigs.input)) {
+        sigs_1 = whichSignatures(tumor.ref = sigs.input, 
+                                   signatures.ref = signatures.exome.cosmic.v3.may2019,
+                                   sample.id = sample, 
+                                   contexts.needed = TRUE,
+                                   signature.cutoff = 0,
+                                   tri.counts.method = 'default')
+        sigs <- rbind(sigs,sigs_1$weights)
+      }
+      
+      sigs <- data.frame(sigs)
+      
+      assign(paste0("sigs", pipe), value = sigs)
+      save(list = paste0("sigs", pipe), file = paste0("sigs", pipe))
+}
+```
+
+```{r K means clustering on PHATE parameters}
+#cancer_phate is the object with clustering on all the programmes
+clusters <- as.vector(cluster_phate(cancer_phate, k=3, seed=2020))
+clusters <- recode(clusters, "0" = "low", "1" = "mid", "2" = "high")
+
+ggplot(cancer_phate, aes(x=PHATE1, y=PHATE2, color = clusters)) +
+  geom_point() +
+  ggtitle("Clustering on all programmes, k=3")
+```
+
+```{r Boxplot for expression values in each of PHATE clusters}
+clusters_annot <- data.frame("Cluster" = clusters, "Patient_long" = rownames(cancer_phate$embedding))
+
+expr$Patient_long <- rownames(expr)
+
+clusters_annot <- merge(x = expr, y = clusters_annot, by = "Patient_long", all.y = T)
+clusters_annot$Cluster <- factor(clusters_annot$Cluster, levels = c("low", "mid", "high"))
+
+p1 <- ggboxplot(clusters_annot, x = "Cluster", y = "Dormancy",
+              color = "Cluster", palette =c("#00AFBB", "#E7B800", "#FC4E07"),
+              add = "jitter")
+p2 <- ggboxplot(clusters_annot, x = "Cluster", y = "Exhaustion",
+              color = "Cluster", palette =c("#00AFBB", "#E7B800", "#FC4E07"),
+              add = "jitter")
+p3 <- ggboxplot(clusters_annot, x = "Cluster", y = "mean_APOBEC",
+              color = "Cluster", palette =c("#00AFBB", "#E7B800", "#FC4E07"),
+              add = "jitter")
+
+my_comparisons <- combn(c("low", "mid", "high"), m = 2, simplify = F)
+p1 <- p1 + stat_compare_means(comparisons = my_comparisons) + # Add pairwise comparisons p-value
+  stat_compare_means(label.y = 13) 
+
+p2 <- p2 + stat_compare_means(comparisons = my_comparisons) + # Add pairwise comparisons p-value
+  stat_compare_means(label.y = 10) 
+
+p3 <- p3 + stat_compare_means(comparisons = my_comparisons) + # Add pairwise comparisons p-value
+  stat_compare_means(label.y = 8) 
+
+save_plot(plot_grid(p1, p2, p3, align = "hv", nrow = 3), filename = paste0(Sys.Date(), "_boxplots.png"), base_height = 12, base_width = 6)
+```
+
+```{r}
+clusters <- data.frame("Cluster" = clusters, "Patient_long" = rownames(cancer_phate$embedding))
+fisher_extremes <- merge(x = clusters, y = rnaseq_annot, by = "Patient_long")
+
+for (tail in c("low", "high")){
+  
+      for (gene in cosmic_list){
+      fisher_data <- fisher_extremes[, c(gene, "Cluster")]
+      
+      fisher_matrix <- matrix(c(length(which(fisher_data[, gene] == 1 & fisher_data[, "Cluster"] == tail)),
+                                length(which(fisher_data[, gene] == 0 & fisher_data[, "Cluster"] == tail)),
+                                length(which(fisher_data[, gene] == 1 & fisher_data[, "Cluster"] != tail)),
+                                length(which(fisher_data[, gene] == 0 & fisher_data[, "Cluster"] != tail))), nrow = 2)
+      
+      rownames(fisher_matrix) <- c("tail", "rest")
+      colnames(fisher_matrix) <- c("MU", "WT")
+      
+      f <- fisher.test(fisher_matrix)
+      
+      if (gene == cosmic_list[1] && tail == "low"){
+      l <- 3
+      results <- vector(mode = "list", length = l)
+      for (i in 1:l){
+        results[[i]] <- data.frame()
+      }
+      }
+      n <- match(tail, c("low", "high"))
+      results[[n]][gene, "p_val"] <- f$p.value
+      results[[n]][gene, "odds"] <- f$estimate
+      results[[n]][gene, "extreme_WT"] <- fisher_matrix["tail", "WT"]
+      results[[n]][gene, "extreme_MU"] <- fisher_matrix["tail", "MU"]
+      results[[n]][gene, "rest_WT"] <- fisher_matrix["rest", "WT"]
+      results[[n]][gene, "rest_MU"] <- fisher_matrix["rest", "MU"]
+      results[[n]][gene, "gene"] <- gene
+      results[[n]][gene, "extreme"] <- tail
+      }
+}
+
+results_all <- bind_rows(results)
+results_all$p_adj <- p.adjust(results_all$p_val, method = "BH")
+results_all <- subset(results_all, p_adj<0.05)
+results_all$p_adj_star <- stars.pval(results_all$p_adj)
+
+write.csv(results_all, file = paste0(Sys.Date(), "_Fisher_k_clusters_3_tests.csv"))
+```
+
+```{r}
+fisher.WL <- function(data, genes, to_test, to_compare){
+  
+        for (tail in to_test){
+          
+              for (gene in genes){
+              fisher_data <- data[, c(gene, "Cluster")]
+              
+              fisher_matrix <- matrix(c(length(which(fisher_data[, gene] == 1 & fisher_data[, "Cluster"] == tail)),
+                                        length(which(fisher_data[, gene] == 0 & fisher_data[, "Cluster"] == tail)),
+                                        length(which(fisher_data[, gene] == 1 & fisher_data[, "Cluster"] %in% to_compare)),
+                                        length(which(fisher_data[, gene] == 0 & fisher_data[, "Cluster"] %in% to_compare))), nrow = 2)
+              
+              rownames(fisher_matrix) <- c("tail", "rest")
+              colnames(fisher_matrix) <- c("MU", "WT")
+              
+              f <- fisher.test(fisher_matrix)
+              
+              if (gene == cosmic_list[1] && tail == to_test[1]){
+              l <- length(to_test)
+              results <- vector(mode = "list", length = l)
+              for (i in 1:l){
+                results[[i]] <- data.frame()
+              }
+              }
+              n <- match(tail, to_test)
+                results[[n]][gene, "p_val"] <- f$p.value
+                results[[n]][gene, "odds"] <- f$estimate
+                results[[n]][gene, "extreme_WT"] <- fisher_matrix["tail", "WT"]
+                results[[n]][gene, "extreme_MU"] <- fisher_matrix["tail", "MU"]
+                results[[n]][gene, "rest_WT"] <- fisher_matrix["rest", "WT"]
+                results[[n]][gene, "rest_MU"] <- fisher_matrix["rest", "MU"]
+                results[[n]][gene, "gene"] <- gene
+                results[[n]][gene, "extreme"] <- tail
+              }
+        }
+        
+        results_all <- bind_rows(results)
+        results_all$p_adj <- p.adjust(results_all$p_val, method = "BH")
+        results_all <- subset(results_all, p_adj<0.05)
+        results_all$p_adj_star <- stars.pval(results_all$p_adj)
+        
+        return(results_all)
+}
+
+to_mid <- fisher.WL(data = fisher_extremes,
+          genes = cosmic_list,
+          to_test = c("low", "high"),
+          to_compare = "mid")
+nrow(to_mid)
+#None found
+
+to_extreme_1 <- fisher.WL(data = fisher_extremes,
+          genes = cosmic_list,
+          to_test = "low",
+          to_compare = "high")
+to_extreme_2 <- fisher.WL(data = fisher_extremes,
+          genes = cosmic_list,
+          to_test = "high",
+          to_compare = "low")
+to_extreme <- rbind(to_extreme_1, to_extreme_2)
+nrow(to_extreme)
+
+to_extreme <- subset(to_extreme, WT<MU)
+write.csv(to_extreme, file = paste0(Sys.Date(), "_Fisher_k_clusters_low_high.csv"))
+```
+
+
+```{r}
+consensusGeneSets <- ConsensusTME::consensusGeneSets
+solid_tumours <- str_to_upper(solid_tumours)
+
+for (tumour in solid_tumours){
+  #Indicate progress
+  print(paste0(tumour, ": This is ", match(tumour, solid_tumours), " out of ", length(solid_tumours)))
+  tumour <- str_to_lower(tumour)
+
+  file_cancer <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga-t.txt.gz")
+  file_ctrl <- paste0("/Users/wojciechlason/GitHub/BIOL0041 Immune dormancy/Wang et al scaled data/TCGA/", tumour, "-rsem-fpkm-tcga.txt.gz")
+  
+  cancer <- read.delim(file_cancer)
+  ctrl <- read.delim(file_ctrl)
+  
+  rownames(cancer) <- cancer$Hugo_Symbol
+  cancer <- cancer[, c(-1, -2)]
+  
+  rownames(ctrl) <- ctrl$Hugo_Symbol
+  ctrl <- ctrl[, c(-1, -2)]
+  
+  cancer_type <- data.frame("Patient_long" = c(colnames(cancer), colnames(ctrl)))
+  cancer_type$Cancer <- as.character(tumour)
+  
+  tumour <- str_to_upper(tumour)
+  if (tumour == solid_tumours[1]){
+    TME_cancer <- list()
+    TME_ctrl <- list()
+    cancer_types <- cancer_type
+  }
+    tumour <- str_to_upper(tumour)
+    
+    TME_cancer[[tumour]] <- as.matrix(cancer)
+    TME_ctrl[[tumour]] <- as.matrix(ctrl)
+    cancer_types <- rbind(cancer_types, cancer_type)
+}
+rm(tumour, file_cancer, file_ctrl, cancer, ctrl, cancer_type)
+
+#Remove outlier:
+drop <- vector()
+for(i in 1:17){
+current_1 <- colnames(TME_cancer[[i]])
+current_2 <- colnames(TME_ctrl[[i]])
+current <- c(current_1, current_2)
+drop <- c(drop, current)  
+}
+rm(current, current_1, current_2)
+drop <- grep("TCGA.38.4625.", x = drop, value = TRUE)
+
+for(i in 1:17){     #Be careful to run this loop only once!
+TME_cancer[[i]] <- TME_cancer[[i]][, !(colnames(TME_cancer[[i]]) %in% drop)]
+TME_ctrl[[i]] <-TME_ctrl[[i]][, !(colnames(TME_ctrl[[i]]) %in% drop)]
+}
+```
+
+```{r}
+solid_tumours <- str_to_upper(solid_tumours)
+immune_estimates <- list()
+for (tumour in solid_tumours){
+  immune_estimates[[tumour]] <- consensusTMEAnalysis(TME_cancer[[tumour]], cancer = tumour, statMethod = "ssgsea")
+}
+rm(iSample, nSamples, progressBar)
+```
+
+
+```{r}
+immune_cells <- rownames(immune_estimates[[1]])
+
+#Make correlation plots for immune infiltration vs. every cancer type
+#N.B. I had to add 'missing' as not all the genes were present in the data for every cancer. E.g. no APOBEC1 and APOBEC4 in BLCA
+#It looks like not all the genes from my APOBEC, dormancy, exhaustion lists are in the datasets and it produced NA columns and created problems with correlation
+for(cancer in solid_tumours){
+    tissue_estimates <- immune_estimates[[cancer]]
+    
+    missing <- setdiff(all_genes_list, rownames(rnaseq_cancer_all))
+    
+    immune_corr <-  merge(t(rnaseq_cancer_all[setdiff(all_genes_list, missing), colnames(tissue_estimates)]), t(tissue_estimates), by = "row.names")
+    immune_corr$Row.names <- NULL
+
+    corr_matrix <- cor(immune_corr, use = "pairwise.complete.obs")
+    p_matrix <- cor.mtest(immune_corr)$p
+    dimnames(p_matrix) <- dimnames(corr_matrix)
+    
+    cols <- colorRampPalette(rev(brewer.pal(n =11, name = "PRGn")))
+    
+    pdf(file = paste(Sys.Date(), cancer, "immune_correlation.pdf", sep = "_"), height = 6, width = 12, title = cancer)
+    corrplot(corr_matrix[immune_cells, setdiff(all_genes_list, missing)],
+             tl.col = "black", 
+             p.mat = p_matrix[immune_cells, setdiff(all_genes_list, missing)],
+             method = "color",
+             pch.cex = 0.8,
+             pch.col = "firebrick",
+             col = cols(100))
+    dev.off()
+}
+
+#Make correlation plots between cell types
+for(cancer in solid_tumours){
+    tissue_estimates <- immune_estimates[[cancer]]
+    cell_cor <- cor(t(tissue_estimates[, -19]))   #Remove the "Immune Score" column as the correlation of scores is not informative
+    p_matrix <- cor.mtest(t(tissue_estimates[, -19]))
+    
+    pdf(file = paste(Sys.Date(), cancer, "inter_cell_correlation.pdf", sep = "_"), height = 12, width = 12, title = cancer)
+    corrplot.mixed(cell_cor,
+                   p.mat = p_matrix$p,
+                   tl.pos = "lt",
+                   tl.col = "black",
+                   number.cex = 1.2,
+                   number.digits = 2,
+                   tl.cex = 1.2)
+    dev.off()
+}
+  
+corr_matrix <- cor(immune_expr, use = "pairwise.complete.obs")
+p_matrix <- cor.mtest(immune_expr)$p
+dimnames(p_matrix) <- dimnames(corr_matrix)
+pdf(file = paste(Sys.Date(), "immune_correlation_prog.pdf", sep = "_"), height = 6, width = 12)
+corrplot(corr_matrix[c("mean_APOBEC", "Dormancy", "Exhaustion"), immune_cells],
+         tl.col = "black",
+         p.mat = p_matrix[c("mean_APOBEC", "Dormancy", "Exhaustion"), immune_cells],
+         pch.cex = 0.8,
+         pch.col = "firebrick",
+         col = cols(100),
+         cl.lim = c(0, 1),
+         cl.length = 5)
+dev.off()
+
+
+
+
+immune_expr <- data.frame(immune_corr[, immune_cells], row.names = rownames(immune_corr))
+immune_expr$mean_APOBEC <- apply(immune_corr[, apobec_list], function (x) mean(x), MARGIN = 1)
+immune_expr$Dormancy <- apply(immune_corr[, dormancy_list], function (x) mean(x), MARGIN = 1)
+immune_expr$Exhaustion <- apply(immune_corr[, exhaustion_list], function (x) mean(x), MARGIN = 1)
+
+
+
+
+```
+
+```{r}
+gg_immune_corr <- melt(immune_corr[, immune_cells])
+colnames(gg_immune_corr) <- c("Patient_long", "Cell_type", "Estimate")
+gg_immune_corr <- merge(x = gg_immune_corr, y = immune_corr[, apobec_list], by.x = "Patient_long", by.y = 'row.names')
+colnames(gg_immune_corr) <- c("Patient_long", "Cell_type", "Estimate", apobec_list)
+
+for(apobec in apobec_list){
+p <- ggplot(gg_immune_corr, aes(y=Estimate, group = Cell_type, color = Cell_type)) + 
+  geom_point(aes_string(x = apobec)) +
+  geom_smooth(colour = "black", method=lm, aes_string(x = apobec)) +
+  facet_wrap(~Cell_type) +
+  theme(legend.position = "none")
+save_plot(p, filename = paste(Sys.Date(), apobec, "correlation_scatter.png", sep = "_"), base_width = 12, base_height = 8)
+}
+
+gg_immune_plot_1 <- melt(immune_corr[, apobec_list])
+gg_immune_plot_2 <- melt(immune_corr[, immune_cells])
+gg_immune_plot <- merge(gg_immune_plot_1, gg_immune_plot_2, by = "Var1")
+rm(gg_immune_plot_1, gg_immune_plot_2)
+colnames(gg_immune_plot) <- c("Patient_long", "Gene", "Expression", "Cell_type", "Estimate")
+
+p <- ggplot(gg_immune_plot, aes(x=Expression, y=Estimate, group = Cell_type, colour = Cell_type)) + 
+  geom_smooth(method=lm) +
+  facet_wrap(~Gene)
+save_plot(p, filename = paste(Sys.Date(), apobec, "correlation_plot.png", sep = "_"), base_width = 12, base_height = 8)
+
+
+gg_immune_expr <- melt(immune_expr, id.vars = c("mean_APOBEC", "Dormancy", "Exhaustion"), variable.name = "Cell_type", value.name = "Estimate")
+gg_immune_expr <- melt(gg_immune_expr, measure.vars = c("mean_APOBEC", "Dormancy", "Exhaustion"), variable.name = "Programme", value.name = "Expression")
+p <- ggplot(gg_immune_expr, aes(x=Expression, y=Estimate, group = Cell_type, colour = Cell_type)) + 
+      geom_smooth(method=lm) +
+      facet_wrap(~Programme, scales = "free_x")
+save_plot(p, filename = paste(Sys.Date(), apobec, "correlation_plots.png", sep = "_"), base_width = 12, base_height = 4)
+```
+
+```{r}
+cor.test(immune_expr$Immune_Score, immune_expr$mean_APOBEC)
+cor.test(immune_expr$Immune_Score, immune_expr$Dormancy)
+cor.test(immune_expr$Immune_Score, immune_expr$Exhaustion)
+```
+
+
+```{r}
+somaticsniper <- readRDS("somaticsniper.rds")
+mutect2 <- readRDS("mutect2.rds")
+muse <- readRDS("muse.rds")
+varscan2 <- readRDS("varscan2.rds")
+
+pipes_compared <- data.frame(pipe = c("mutect2", "muse", "somaticsniper", "varscan2"), mutations = c(mutect2[["no_muts"]], muse[["no_muts"]], somaticsniper[["no_muts"]], varscan2[["no_muts"]]))
+p <- ggplot(pipes_compared, aes(x=pipe, y=mutations, fill=pipe)) +
+  geom_bar(stat = "identity") +
+  geom_text(stat='identity', aes(label=mutations), y = 1.5e6, fontface = "bold") +
+  theme(legend.position = "none")
+save_plot(p, filename = "pipes_compared.png")
+```
+
+```{r}
+rnaseq_cancer[is.na(rnaseq_cancer)] <- 0
+
+expr <- data.frame(row.names = colnames(rnaseq_cancer))
+expr$mean_APOBEC <- apply(rnaseq_cancer[apobec_list, ], function (x) mean(x), MARGIN = 2)
+expr$Dormancy <- apply(rnaseq_cancer[dormancy_list, ], function (x) mean(x), MARGIN = 2)
+expr$Exhaustion <- apply(rnaseq_cancer[exhaustion_list, ], function (x) mean(x), MARGIN = 2)
+
+expr$Patient_short <- sapply(rownames(expr),
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+png(file = "mutect_corr_by_tissue.png", res = 400)
+par(mcol = c(17, 1))
+for(cancer in solid_tumours){
+
+snvs <- mutect2[[cancer]]
+snvs$Patient_short <- sapply(rownames(snvs),
+                             function(x) paste(str_split(x, "-", simplify = T)[1:4], collapse = "-"))
+
+corr <- merge(expr, snvs, by = "Patient_short")
+SBS_matrix <- cor(corr[, 2:69], use = "pairwise.complete.obs")
+p_matrix <- cor.mtest(corr[, 2:69])$p
+
+corrplot(SBS_matrix[4:68, c("mean_APOBEC", "Dormancy", "Exhaustion")],
+         method = "color",
+         insig = "label_sig",
+         p.mat = p_matrix[4:68, 1:3],
+         cl.pos = "b",
+         pch.cex = 1,
+         is.corr = F,
+         tl.col = "black",
+         cl.length = 3,
+         cl.cex = 0.8)
+}
+dev.off()
+
+```
+
+```{r}
+mutect2_all <- do.call(rbind, c(mutect2[1:17], make.row.names=T))
+
+mutect2_all$Patient_short <- sapply(rownames(mutect2_all),
+                             function(x) paste(str_split(x, "\\.", simplify = T)[2]))
+mutect2_all$Patient_short <- sapply(mutect2_all$Patient_short,
+                             function(x) paste(str_split(x, "-", simplify = T)[1:4], collapse = "-"))
+
+
+expr$Patient_short <- sapply(rownames(expr),
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+
+mutect2_corr <- merge(expr, mutect2_all, by = "Patient_short")
+SBS <- grep(colnames(mutect2_corr), pattern = "^SBS", value = T)
+
+SBS_matrix <- cor(mutect2_corr[, c(SBS, "Dormancy", "Exhaustion", "mean_APOBEC")])
+p_matrix <- cor.mtest(mutect2_corr[, c(SBS, "Dormancy", "Exhaustion", "mean_APOBEC")])$p
+dimnames(p_matrix) <- dimnames(SBS_matrix)
+
+###Figures for the dissertation
+###Horizontal version
+indices <- list(c(1, 16), c(17, 33), c(34, 50), c(51, 65))
+pdf(paste0(Sys.Date(), "_mutect2_corr.pdf"), width = 6, height = 2)
+for(i in 1:4){
+start <- indices[[i]][1]
+end <- indices[[i]][2]
+
+if (i<=3){
+corrplot(SBS_matrix[c("mean_APOBEC", "Dormancy", "Exhaustion"), SBS[start:end]],
+         method = "color",
+         insig = "label_sig",
+         p.mat = p_matrix[c("mean_APOBEC", "Dormancy", "Exhaustion"), SBS[start:end]],
+         cl.pos = "n",
+         pch.cex = 1.4,
+         is.corr = F,
+         tl.col = "black")
+} else {
+corrplot(SBS_matrix[c("mean_APOBEC", "Dormancy", "Exhaustion"), SBS[start:end]],
+         method = "color",
+         insig = "label_sig",
+         p.mat = p_matrix[c("mean_APOBEC", "Dormancy", "Exhaustion"), SBS[start:end]],
+         cl.pos = "b",
+         cl.ratio = 1,
+         cl.length = 7,
+         pch.cex = 1.4,
+         is.corr = F,
+         tl.col = "black")
+}
+}
+dev.off()
+
+###Vertical version
+indices <- list(c(1, 13), c(14, 26), c(27, 39), c(40, 52), c(53, 65))
+pdf(paste0(Sys.Date(), "_mutect2_corr_ver_2.pdf"), width = 3, height = 4)
+for(i in 1:6){
+start <- indices[[i]][1]
+end <- indices[[i]][2]
+
+if (i<=4){
+corrplot(t(SBS_matrix[c("mean_APOBEC", "Dormancy", "Exhaustion"), SBS[start:end]]),
+         method = "color",
+         insig = "label_sig",
+         p.mat = t(p_matrix[c("mean_APOBEC", "Dormancy", "Exhaustion"), SBS[start:end]]),
+         cl.pos = "n",
+         pch.cex = 1.4,
+         is.corr = F,
+         tl.col = "black")
+} else {
+corrplot(t(SBS_matrix[c("mean_APOBEC", "Dormancy", "Exhaustion"), SBS[start:end]]),
+         method = "color",
+         insig = "label_sig",
+         p.mat = t(p_matrix[c("mean_APOBEC", "Dormancy", "Exhaustion"), SBS[start:end]]),
+         cl.pos = "r",
+         cl.ratio = 1,
+         cl.length = 7,
+         pch.cex = 1.4,
+         is.corr = F,
+         tl.col = "black")
+}
+}
+dev.off()
+```
+
+
+```{r}
+for (SBS in c("SBS1", "SBS2", "SBS13")){
+  for (prog in c("mean_APOBEC", "Dormancy", "Exhaustion")){
+    p <- ggscatter(mutect2_corr, x = prog, y = SBS,
+          color = "lightgrey", shape = 16, size = 1, # Points color, shape and size
+          add = "reg.line",  # Add regressin line
+          add.params = list(color = "#FC4E07", fill = "#E7B800", size = 0.8), # Customize reg. line
+          conf.int = TRUE, # Add confidence interval
+          cor.coef = TRUE, # Add correlation coefficient. see ?stat_cor
+          cor.coeff.args = list(method = "pearson", label.x.npc = "left", label.y.npc ="top", label.sep = "\n"))
+    save_plot(p, filename = paste(Sys.Date(), SBS, prog, "patient_correlations.svg", sep = "_"), base_height = 2.75, base_width = 2.75)
+  }
+}
+
+```
+
+
+
+```{r}
+somaticsniper_all <- do.call(rbind, c(somaticsniper[1:17], make.row.names=T))
+
+somaticsniper_all$Patient_short <- sapply(rownames(somaticsniper_all),
+                             function(x) paste(str_split(x, "\\.", simplify = T)[2]))
+somaticsniper_all$Patient_short <- sapply(somaticsniper_all$Patient_short,
+                             function(x) paste(str_split(x, "-", simplify = T)[1:4], collapse = "-"))
+
+
+expr$Patient_short <- sapply(rownames(expr),
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+
+somaticsniper_corr <- merge(expr, somaticsniper_all, by = "Patient_short")
+SBS_matrix <- cor(somaticsniper_corr[, 2:69])
+p_matrix <- cor.mtest(somaticsniper_corr[, 2:69])$p
+
+png(paste0(Sys.Date(), "_somaticsniper_corr.png"), width = 6, height = 12, units = "in", res = 600)
+corrplot(SBS_matrix[4:68, c("mean_APOBEC", "Dormancy", "Exhaustion")],
+         method = "color",
+         insig = "label_sig",
+         p.mat = p_matrix[4:68, 1:3],
+         cl.pos = "b",
+         pch.cex = 1,
+         is.corr = F,
+         tl.col = "black",
+         cl.length = 3,
+         cl.cex = 0.8)
+dev.off()
+```
+
+
+```{r}
+varscan2_all <- do.call(rbind, c(varscan2[1:17], make.row.names=T))
+
+varscan2_all$Patient_short <- sapply(rownames(varscan2_all),
+                             function(x) paste(str_split(x, "\\.", simplify = T)[2]))
+varscan2_all$Patient_short <- sapply(varscan2_all$Patient_short,
+                             function(x) paste(str_split(x, "-", simplify = T)[1:4], collapse = "-"))
+
+
+expr$Patient_short <- sapply(rownames(expr),
+                             function(x) paste(str_split(x, "\\.", simplify = T)[1:4], collapse = "-"))
+
+varscan2_corr <- merge(expr, varscan2_all, by = "Patient_short")
+SBS_matrix <- cor(varscan2_corr[, 2:69])
+p_matrix <- cor.mtest(varscan2_corr[, 2:69])$p
+
+png(paste0(Sys.Date(), "_varscan2_corr.png"), width = 6, height = 12, units = "in", res = 600)
+corrplot(SBS_matrix[4:68, c("mean_APOBEC", "Dormancy", "Exhaustion")],
+         method = "color",
+         insig = "label_sig",
+         p.mat = p_matrix[4:68, 1:3],
+         cl.pos = "b",
+         pch.cex = 1,
+         is.corr = F,
+         tl.col = "black",
+         cl.length = 3,
+         cl.cex = 0.8)
+dev.off()
+```
+
